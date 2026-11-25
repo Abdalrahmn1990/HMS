@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock
 
-from hospital_app import HospitalApp, appointment_wait_minutes, dashboard_snapshot
+from hospital_app import PAGES, HospitalApp, appointment_wait_minutes, dashboard_snapshot
 
 
 class DashboardStore:
@@ -113,6 +113,65 @@ class DashboardSnapshotTests(unittest.TestCase):
         record = HospitalApp.prepare_record(app, "meds", {"qty": "5", "min_qty": "5"})
 
         self.assertEqual(record["status"], "منخفض")
+
+
+class HospitalLocationTests(unittest.TestCase):
+    def test_location_page_is_registered_and_visible_to_reception(self):
+        app = Mock()
+        app.role = "reception"
+
+        self.assertIn("location", PAGES)
+        self.assertTrue(HospitalApp.can_view(app, "location"))
+
+    def test_admin_saves_location_details_and_map_marker_to_existing_settings(self):
+        app = Mock()
+        app.role = "admin"
+        app.location_vars = {
+            "name": Mock(get=Mock(return_value="مشفى النور")),
+            "address": Mock(get=Mock(return_value="شارع الصحة")),
+            "city": Mock(get=Mock(return_value="حلب")),
+            "phone": Mock(get=Mock(return_value="0123456")),
+        }
+        app.location_map_x = 0.72
+        app.location_map_y = 0.41
+        app.label_text.side_effect = lambda text: text
+
+        HospitalApp.save_hospital_location(app)
+
+        app.store.set_setting.assert_any_call("hospital_name", "مشفى النور")
+        app.store.set_setting.assert_any_call("hospital_location_address", "شارع الصحة")
+        app.store.set_setting.assert_any_call("hospital_location_city", "حلب")
+        app.store.set_setting.assert_any_call("hospital_location_phone", "0123456")
+        app.store.set_setting.assert_any_call("hospital_location_map_x", "0.72000")
+        app.store.set_setting.assert_any_call("hospital_location_map_y", "0.41000")
+        app.audit.assert_called_once_with("تحديث بيانات موقع المشفى")
+        app.rebuild.assert_called_once_with()
+
+    def test_non_admin_cannot_save_location_settings(self):
+        app = Mock()
+        app.role = "doctor"
+        app.label_text.side_effect = lambda text: text
+
+        HospitalApp.save_hospital_location(app)
+
+        app.store.set_setting.assert_not_called()
+        app.notify.assert_called_once_with("لا تملك صلاحية تعديل بيانات الموقع", "error")
+
+
+class NotificationSoundTests(unittest.TestCase):
+    def test_notification_sound_respects_the_saved_setting(self):
+        app = Mock()
+        app.store.setting.return_value = "1"
+
+        HospitalApp.play_notification_sound(app)
+
+        app.root.bell.assert_called_once_with()
+
+        app.store.setting.return_value = "0"
+        app.root.bell.reset_mock()
+        HospitalApp.play_notification_sound(app)
+
+        app.root.bell.assert_not_called()
 
 
 if __name__ == "__main__":

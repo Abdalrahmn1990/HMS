@@ -1,0 +1,20 @@
+{
+  "name": "المشفى العالمي - نظام إدارة المشفى",
+  "short_name": "المشفى العالمي",
+  "description": "نظام محلي لإدارة المشفى والمرضى والمواعيد",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "./a.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f0f4f8",
+  "theme_color": "#0b3d91",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

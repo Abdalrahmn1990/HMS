@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import html
 import json
 import math
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import tempfile
@@ -22,12 +25,6 @@ from urllib.parse import quote
 APP_DIR = Path.home() / ".hospital_manager"
 DB_PATH = APP_DIR / "hospital.db"
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
-
-USERS = {
-    "admin": ("1234", "د.عبدالرحمن بهجت العثمان", "admin"),
-    "doctor": ("1234", "د. ليلى ناصر", "doctor"),
-    "reception": ("1234", "سامر العلي", "reception"),
-}
 
 DEFAULT_CLINICS = [
     {"id": 1, "name": "عيادة القلب", "specialty": "قلبية", "icon": "❤️", "description": "أمراض القلب والأوعية الدموية", "status": "مفتوحة"},
@@ -126,6 +123,9 @@ DEFAULT_DATA = {
     "payments": [], "insurance": [], "payroll": [], "attendance": [], "ratings": [], "attachments": [],
     "reminders": [], "activity": [], "patientNotes": [], "death_certificate_requests": [],
     "support_tickets": [], "medication_batches": [], "insurance_claims": [],
+    "medical_devices": [
+        {"id": 1, "name": "جهاز تنفس اصطناعي - غرفة الطوارئ", "type": "تنفس صناعي", "serial_number": "VENT-001", "location": "غرفة الطوارئ", "department": "الطوارئ", "status": "يعمل", "maintenance_due": date.today().isoformat(), "last_service": date.today().isoformat(), "responsible": "قسم الصيانة", "notes": "فحص دوري"},
+    ],
     "assets": [], "sterilization_cycles": [], "feedback": [], "service_prices": [],
     "donations": [], "messages": [], "operation_rooms": [
         {"id": 1, "name": "غرفة العمليات 1", "location": "الطابق الأول", "status": "متاحة"},
@@ -133,6 +133,11 @@ DEFAULT_DATA = {
         {"id": 3, "name": "غرفة العمليات 3", "location": "الطابق الثاني", "status": "متاحة"},
     ],
     "surgeries": [],
+    "diagnoses": [],
+    "radiology": [],
+    "infection_control": [],
+    "staff_credentials": [],
+    "translation": [],
 }
 
 
@@ -142,6 +147,15 @@ def field(label, kind="text", default="", options=None):
 
 PAGES = {
     "dashboard": {"title": "لوحة التحكم", "entity": None, "columns": []},
+    "command_center": {"title": "غرفة القيادة المركزية", "entity": None, "columns": []},
+    "location": {"title": "موقع المشفى", "entity": None, "columns": []},
+    "department_map": {"title": "خريطة الأقسام", "entity": None, "columns": []},
+    "staff_credentials": {"title": "بطاقات وبصمة الموظفين", "entity": "staff_credentials", "columns": [("employee", "الموظف"), ("role", "الوظيفة"), ("department", "القسم"), ("card_id", "رقم البطاقة"), ("access_level", "صلاحية الدخول"), ("status", "الحالة")]},
+    "infection_control": {"title": "مكافحة العدوى", "entity": "infection_control", "columns": [("date", "التاريخ"), ("department", "القسم"), ("type", "نوع الفحص"), ("positive_cases", "حالات مؤكدة"), ("isolated_beds", "أسرة العزل"), ("status", "الحالة")]},
+    "diagnoses": {"title": "التشخيصات", "entity": "diagnoses", "columns": [("patient", "المريض"), ("date", "التاريخ"), ("doctor", "الطبيب"), ("diagnosis", "التشخيص"), ("severity", "الخطورة"), ("status", "الحالة")]},
+    "radiology": {"title": "الأشعة", "entity": "radiology", "columns": [("patient", "المريض"), ("date", "التاريخ"), ("type", "الفحص"), ("body_part", "المنطقة"), ("status", "الحالة"), ("radiologist", "المشرف")]},
+    "translation": {"title": "الترجمة الفورية", "entity": "translation", "columns": [("patient", "المريض"), ("language", "اللغة"), ("mode", "النمط"), ("source_text", "النص المصدر"), ("translated_text", "الترجمة"), ("reviewed", "مراجعة بشرية")]},
+    "medical_devices": {"title": "الأجهزة الطبية", "entity": "medical_devices", "columns": [("name", "الجهاز"), ("type", "النوع"), ("serial_number", "الرقم التسلسلي"), ("department", "القسم"), ("location", "الموقع"), ("status", "الحالة"), ("maintenance_due", "الصيانة القادمة")]},
     "clinics": {"title": "إدارة العيادات", "entity": "clinics", "columns": [("name", "العيادة"), ("specialty", "التخصص"), ("description", "الوصف"), ("status", "الحالة")]},
     "doctors": {"title": "الأطباء", "entity": "doctors", "columns": [("name", "الاسم"), ("spec", "التخصص"), ("phone", "الهاتف"), ("status", "الحالة"), ("verification", "التحقق")]},
     "nurses": {"title": "التمريض", "entity": "nurses", "columns": [("name", "الاسم"), ("department", "القسم"), ("shift", "المناوبة"), ("status", "الحالة")]},
@@ -178,6 +192,45 @@ PAGES = {
 }
 
 ENGLISH = {
+    "التنقل": "Navigation",
+    "إدارة المستخدمين": "User management",
+    "إدارة الحسابات": "Account management",
+    "عودة": "Back",
+    "لا توجد بيانات دخول افتراضية. أنشئ حساب المدير عند التشغيل الأول.": "No default sign-in credentials. Create the administrator account at first launch.",
+    "إنشاء حساب المدير الأول": "Create the first administrator account",
+    "أنشئ بيانات دخول فريدة للمسؤول الأول.": "Create unique sign-in credentials for the first administrator.",
+    "اسم المستخدم": "Username",
+    "الاسم الظاهر": "Display name",
+    "كلمة المرور (12 حرفاً على الأقل)": "Password (at least 12 characters)",
+    "تأكيد كلمة المرور": "Confirm password",
+    "إنشاء الحساب": "Create account",
+    "حساب جديد": "New account",
+    "الدور": "Role",
+    "إيقاف المحدد": "Deactivate selected",
+    "إعادة تعيين كلمة المرور": "Reset password",
+    "لا يمكن إيقاف الحساب المستخدم حالياً.": "You cannot deactivate the currently signed-in account.",
+    "موقع المشفى": "Hospital location",
+    "خريطة تخطيطية محلية — لا تستخدم خدمات أو خرائط خارجية.": "Local schematic map — no external map or network service is used.",
+    "مخطط المنطقة": "Area schematic",
+    "بيانات الموقع": "Location details",
+    "اسم المشفى": "Hospital name",
+    "العنوان": "Address",
+    "المدينة": "City",
+    "هاتف الاتصال": "Contact phone",
+    "انقر على الخريطة لتحديد موضع المشفى.": "Click the map to place the hospital marker.",
+    "موضع العلامة محدّث؛ اضغط حفظ لتثبيته.": "Marker updated; save to keep this position.",
+    "حفظ بيانات الموقع": "Save location details",
+    "تغيير اسم المشفى يحدّث هوية التطبيق أيضاً.": "Changing the hospital name also updates the app branding.",
+    "يمكن للمدير تعديل بيانات الموقع وموضع العلامة.": "An administrator can edit location details and the marker.",
+    "لا تملك صلاحية تعديل بيانات الموقع": "You do not have permission to edit location details.",
+    "تم حفظ بيانات موقع المشفى": "Hospital location details saved.",
+    "حديقة": "Park",
+    "مساحة خضراء": "Green space",
+    "الطريق الرئيسي": "Main road",
+    "مسار الطوارئ": "Emergency route",
+    "دليل الخريطة": "Map legend",
+    "مبنى": "Building",
+    "رسم تخطيطي محلي": "Local schematic",
     "الاسم": "Name", "التخصص": "Specialty", "الهاتف": "Phone", "الحالة": "Status",
     "العمر": "Age", "الجنس": "Gender", "المريض": "Patient", "الطبيب": "Doctor",
     "التاريخ": "Date", "الوقت": "Time", "الدواء": "Medicine", "الفئة": "Category",
@@ -405,6 +458,62 @@ FORM_FIELDS = {
         ("maintenance_cost", field("تكلفة الصيانة", "number", "0")),
         ("status", field("الحالة", "choice", "يعمل", ["يعمل", "قيد الصيانة", "خارج الخدمة"])),
     ],
+    "medical_devices": [
+        ("name", field("اسم الجهاز")),
+        ("type", field("نوع الجهاز", "choice", "مراقبة", ["تنفس صناعي", "مراقبة", "مصفاة/تصفية", "تصوير", "مختبر", "تخدير", "أخرى"])),
+        ("serial_number", field("الرقم التسلسلي")),
+        ("department", field("القسم")),
+        ("location", field("الموقع داخل المشفى")),
+        ("status", field("حالة الجهاز", "choice", "يعمل", ["يعمل", "قيد الصيانة", "خارج الخدمة", "عطل"])),
+        ("maintenance_due", field("الصيانة القادمة YYYY-MM-DD", "date", date.today().isoformat())),
+        ("last_service", field("آخر صيانة YYYY-MM-DD", "date", date.today().isoformat())),
+        ("responsible", field("مسؤول الصيانة")),
+        ("notes", field("ملاحظات العطل والصيانة", "multiline")),
+    ],
+    "diagnoses": [
+        ("patient", field("المريض", "patient")),
+        ("doctor", field("الطبيب", "doctor")),
+        ("diagnosis", field("التشخيص")),
+        ("severity", field("الخطورة", "choice", "عادي", ["عادي", "متوسط", "عالٍ", "حرج"])),
+        ("date", field("التاريخ YYYY-MM-DD", "date", date.today().isoformat())),
+        ("status", field("الحالة", "choice", "نشط", ["نشط", "تحت المراجعة", "مغلق"])),
+        ("notes", field("ملاحظات سريرية", "multiline")),
+    ],
+    "radiology": [
+        ("patient", field("المريض", "patient")),
+        ("type", field("نوع الأشعة", "choice", "أشعة سينية", ["أشعة سينية", "CT", "MRI", "أمواج فوق صوتية", "ماموجرافي"])),
+        ("body_part", field("المنطقة")),
+        ("radiologist", field("المشرف")),
+        ("date", field("التاريخ YYYY-MM-DD", "date", date.today().isoformat())),
+        ("status", field("الحالة", "choice", "مجدول", ["مجدول", "تم التصوير", "جاهز للمراجعة", "تمت المراجعة"])),
+        ("report", field("تقرير الفحص", "multiline")),
+    ],
+    "infection_control": [
+        ("department", field("القسم")),
+        ("type", field("نوع الفحص", "choice", "مراقبة عدوى", ["مراقبة عدوى", "عينات بيئية", "التزام التعقيم", "تفشي محتمل"])),
+        ("positive_cases", field("الحالات المؤكدة", "number", "0")),
+        ("isolated_beds", field("أسرة العزل", "number", "0")),
+        ("date", field("التاريخ YYYY-MM-DD", "date", date.today().isoformat())),
+        ("status", field("الحالة", "choice", "مراقبة", ["مراقبة", "نشطة", "مغلقة"])),
+        ("action", field("الإجراء الوقائي", "multiline")),
+    ],
+    "staff_credentials": [
+        ("employee", field("اسم الموظف")),
+        ("role", field("الوظيفة")),
+        ("department", field("القسم")),
+        ("card_id", field("رقم البطاقة الذكية")),
+        ("access_level", field("صلاحية الدخول", "choice", "موظف", ["موظف", "مسؤول قسم", "طبيب", "طوارئ", "مدير"])),
+        ("status", field("الحالة", "choice", "نشطة", ["نشطة", "موقوفة", "منتهية"])),
+        ("biometric_registered", field("بيانات البصمة مسجلة؟", "choice", "لا", ["نعم", "لا"])),
+    ],
+    "translation": [
+        ("patient", field("المريض", "patient_optional")),
+        ("language", field("اللغة")),
+        ("mode", field("النمط", "choice", "نصي", ["نصي", "محادثة"])),
+        ("source_text", field("النص المصدر", "multiline")),
+        ("translated_text", field("الترجمة المحلية", "multiline")),
+        ("reviewed", field("مراجعة بشرية", "choice", "لا", ["نعم", "لا"])),
+    ],
     "sterilization_cycles": [
         ("instrument_set", field("مجموعة الأدوات")),
         ("operator", field("المعقّم")),
@@ -612,6 +721,10 @@ def dashboard_snapshot(store, today=None, now=None):
         and not item.get("sample_data")
         and not item.get("demo")
     ]
+    try:
+        medical_devices = store.list("medical_devices")
+    except (KeyError, AttributeError, sqlite3.Error):
+        medical_devices = []
     return {
         "patients": len(store.list("patients")),
         "appointments_today": appointments_today,
@@ -625,6 +738,10 @@ def dashboard_snapshot(store, today=None, now=None):
             item for item in store.list("assets")
             if item.get("maintenance_due") and item.get("maintenance_due") <= today
             and item.get("status") != "خارج الخدمة"
+        ],
+        "medical_device_alerts": [
+            item for item in medical_devices
+            if item.get("status") in ("عطل", "خارج الخدمة")
         ],
         "sterilization_alerts": [
             item for item in store.list("sterilization_cycles")
@@ -698,6 +815,16 @@ class HospitalStore:
             "CREATE TABLE IF NOT EXISTS records (entity TEXT NOT NULL, record_id INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(entity, record_id))"
         )
         self.connection.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS user_accounts (
+                username TEXT PRIMARY KEY COLLATE NOCASE,
+                display_name TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('admin', 'doctor', 'reception')),
+                salt BLOB NOT NULL,
+                password_hash BLOB NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
+            )"""
+        )
         self.connection.commit()
         if self.connection.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0:
             for entity, rows in DEFAULT_DATA.items():
@@ -986,6 +1113,171 @@ class HospitalStore:
         self.connection.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (key, str(value)))
         self.connection.commit()
 
+    def account_count(self):
+        return int(self.connection.execute("SELECT COUNT(*) FROM user_accounts").fetchone()[0])
+
+    @staticmethod
+    def _password_hash(password, salt):
+        return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310000)
+
+    def create_user(self, username, display_name, role, password, actor="النظام"):
+        username = str(username).strip()
+        display_name = str(display_name).strip()
+        if not 3 <= len(username) <= 64 or not display_name:
+            raise ValueError("أدخل اسم مستخدم من 3 إلى 64 حرفاً واسماً ظاهراً")
+        if role not in ("admin", "doctor", "reception"):
+            raise ValueError("الدور المحدد غير صالح")
+        if len(password) < 12:
+            raise ValueError("يجب أن تتكون كلمة المرور من 12 حرفاً على الأقل")
+        if self.connection.execute(
+            "SELECT 1 FROM user_accounts WHERE username=?",
+            (username,),
+        ).fetchone():
+            raise ValueError("اسم المستخدم مستخدم بالفعل")
+        salt = secrets.token_bytes(16)
+        password_hash = self._password_hash(password, salt)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                "INSERT INTO user_accounts(username, display_name, role, salt, password_hash) VALUES (?, ?, ?, ?, ?)",
+                (username, display_name, role, salt, password_hash),
+            )
+            self._audit(actor, f"إنشاء حساب مستخدم {username} بدور {role}")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def create_users(self, accounts, actor="النظام"):
+        prepared = []
+        usernames = set()
+        for account in accounts:
+            username = str(account["username"]).strip()
+            display_name = str(account["display_name"]).strip()
+            role = account["role"]
+            password = account["password"]
+            if not 3 <= len(username) <= 64 or not display_name:
+                raise ValueError("أدخل اسم مستخدم من 3 إلى 64 حرفاً واسماً ظاهراً")
+            if role not in ("admin", "doctor", "reception"):
+                raise ValueError("الدور المحدد غير صالح")
+            if len(password) < 12:
+                raise ValueError("يجب أن تتكون كلمة مرور من 12 حرفاً على الأقل لكل حساب")
+            normalized = username.casefold()
+            if normalized in usernames:
+                raise ValueError(f"اسم المستخدم {username} مكرر في الدفعة")
+            if self.connection.execute(
+                "SELECT 1 FROM user_accounts WHERE username=?",
+                (username,),
+            ).fetchone():
+                raise ValueError(f"اسم المستخدم {username} مستخدم بالفعل")
+            usernames.add(normalized)
+            salt = secrets.token_bytes(16)
+            prepared.append((username, display_name, role, salt, self._password_hash(password, salt)))
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            for username, display_name, role, salt, password_hash in prepared:
+                self.connection.execute(
+                    "INSERT INTO user_accounts(username, display_name, role, salt, password_hash) VALUES (?, ?, ?, ?, ?)",
+                    (username, display_name, role, salt, password_hash),
+                )
+                self._audit(actor, f"إنشاء حساب مستخدم {username} بدور {role}")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def authenticate_user(self, username, password):
+        row = self.connection.execute(
+            "SELECT username, display_name, role, salt, password_hash FROM user_accounts WHERE username=? AND active=1",
+            (str(username).strip(),),
+        ).fetchone()
+        if not row:
+            return None
+        candidate = self._password_hash(password, row["salt"])
+        if not hmac.compare_digest(candidate, row["password_hash"]):
+            return None
+        return {"username": row["username"], "name": row["display_name"], "role": row["role"]}
+
+    def list_user_accounts(self):
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT username, display_name, role, active FROM user_accounts ORDER BY username COLLATE NOCASE"
+            )
+        ]
+
+    def set_user_active(self, username, active, actor):
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT role, active FROM user_accounts WHERE username=?",
+                (username,),
+            ).fetchone()
+            if not row:
+                raise ValueError("حساب المستخدم غير موجود")
+            if row["role"] == "admin" and row["active"] and not active:
+                active_admins = self.connection.execute(
+                    "SELECT COUNT(*) FROM user_accounts WHERE role='admin' AND active=1"
+                ).fetchone()[0]
+                if active_admins <= 1:
+                    raise ValueError("لا يمكن إيقاف آخر حساب مدير نشط")
+            self.connection.execute(
+                "UPDATE user_accounts SET active=? WHERE username=?",
+                (int(bool(active)), username),
+            )
+            self._audit(actor, f"{'تفعيل' if active else 'إيقاف'} حساب المستخدم {username}")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def change_user_password(self, username, password, actor):
+        if len(password) < 12:
+            raise ValueError("يجب أن تتكون كلمة المرور من 12 حرفاً على الأقل")
+        salt = secrets.token_bytes(16)
+        password_hash = self._password_hash(password, salt)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self.connection.execute(
+                "UPDATE user_accounts SET salt=?, password_hash=? WHERE username=?",
+                (salt, password_hash, username),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("حساب المستخدم غير موجود")
+            self._audit(actor, f"تغيير كلمة مرور حساب المستخدم {username}")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def delete_user(self, username, actor):
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT role, active FROM user_accounts WHERE username=?",
+                (username,),
+            ).fetchone()
+            if not row:
+                raise ValueError("حساب المستخدم غير موجود")
+            if row["role"] == "admin" and row["active"]:
+                active_admins = self.connection.execute(
+                    "SELECT COUNT(*) FROM user_accounts WHERE role='admin' AND active=1"
+                ).fetchone()[0]
+                if active_admins <= 1:
+                    raise ValueError("لا يمكن حذف آخر حساب مدير نشط")
+            cursor = self.connection.execute(
+                "DELETE FROM user_accounts WHERE username=?",
+                (username,),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("حساب المستخدم غير موجود")
+            self._audit(actor, f"حذف حساب المستخدم {username}")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def _audit(self, actor, action):
         entity = "activity"
         record = {"id": self.next_id(entity), "user": actor, "action": action, "date": datetime.now().astimezone().isoformat(timespec="seconds")}
@@ -1039,7 +1331,8 @@ class HospitalStore:
             raise ValueError("بنية النسخة الاحتياطية غير صالحة")
         backward_compatible_entities = {
             "nurses", "attendance", "messages", "death_certificate_requests", "clinics", "donations", "operation_rooms", "surgeries", "support_tickets",
-            "medication_batches", "insurance_claims", "assets", "sterilization_cycles", "feedback", "service_prices",
+            "medication_batches", "insurance_claims", "assets", "medical_devices", "sterilization_cycles", "feedback", "service_prices",
+            "diagnoses", "radiology", "infection_control", "staff_credentials", "translation",
         }
         missing = [key for key in DEFAULT_DATA if key not in backward_compatible_entities and not isinstance(data.get(key), list)]
         if missing:
@@ -1177,6 +1470,7 @@ class HospitalApp:
         self.root = root
         self.store = store or HospitalStore()
         self.user_name = ""
+        self.username = ""
         self.role = ""
         self.language = self.store.setting("language", "ar")
         self.dark = self.store.setting("theme", "light") == "dark"
@@ -1191,55 +1485,146 @@ class HospitalApp:
         self.sort_state = {}
         self.clinic_booking_specialty = None
         self.hospital_name = self.store.setting("hospital_name", "المشفى العالمي")
-        self.accent = self.store.setting("accent", "#0b3d91")
+        self.accent = self.store.setting("accent", "#087f8c")
         self.root.title(self.hospital_name)
-        self.root.geometry("1360x820")
-        self.root.minsize(900, 600)
+        self.root.geometry("1536x960")
+        self.root.minsize(1180, 700)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.apply_theme()
         self.show_login()
 
     def apply_theme(self):
         self.bg, self.fg, self.panel = (
-            ("#111827", "#f8fafc", "#1f2937") if self.dark
-            else ("#eef3f7", "#1e293b", "#ffffff")
+            ("#07111f", "#f4fbff", "#101d2c") if self.dark
+            else ("#eef5f8", "#102a43", "#ffffff")
         )
-        self.muted = "#94a3b8" if self.dark else "#64748b"
-        self.line = "#334155" if self.dark else "#dfe8ef"
+        self.muted = "#93a9ba" if self.dark else "#647b8c"
+        self.line = "#20384d" if self.dark else "#d8e6ed"
+        self.sidebar_bg = "#081827" if not self.dark else "#06101a"
+        self.header_bg = "#fbfdfe" if not self.dark else "#101d2c"
+        self.button_hover = "#056b76"
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure(".", font=("Segoe UI", 10), background=self.bg, foreground=self.fg)
+        style.configure(".", font=("Segoe UI", 11), background=self.bg, foreground=self.fg)
         style.configure("TFrame", background=self.bg)
         style.configure("Panel.TFrame", background=self.panel)
         style.configure("Card.TFrame", background=self.panel, borderwidth=1, relief="solid")
         style.configure("Login.TFrame", background=self.panel, borderwidth=1, relief="solid")
+        style.configure("Toolbar.TFrame", background=self.panel)
+        style.configure("Header.TFrame", background=self.header_bg)
+        style.configure("Sidebar.TFrame", background=self.sidebar_bg)
+        style.configure("Sidebar.TLabel", background=self.sidebar_bg, foreground="#eaf8f6")
         style.configure("TLabel", background=self.bg, foreground=self.fg)
         style.configure("Panel.TLabel", background=self.panel, foreground=self.fg)
+        style.configure("Header.TLabel", background=self.header_bg, foreground=self.fg)
         style.configure("Muted.TLabel", background=self.panel, foreground=self.muted)
-        style.configure("TLabelframe", background=self.bg, foreground=self.fg, bordercolor=self.line, borderwidth=1, relief="solid")
-        style.configure("TLabelframe.Label", background=self.bg, foreground=self.accent, font=("Segoe UI", 10, "bold"))
-        style.configure("TEntry", fieldbackground=self.panel, foreground=self.fg, bordercolor=self.line, lightcolor=self.line, darkcolor=self.line, padding=(9, 7))
+        style.configure("Section.TLabel", background=self.sidebar_bg, foreground="#94a3b8", font=("Segoe UI", 9, "bold"))
+        style.configure("TLabelframe", background=self.panel, foreground=self.fg, bordercolor=self.line, borderwidth=1, relief="solid")
+        style.configure("TLabelframe.Label", background=self.panel, foreground=self.accent, font=("Segoe UI", 10, "bold"))
+        style.configure("TEntry", fieldbackground=self.panel, foreground=self.fg, bordercolor=self.line, lightcolor=self.line, darkcolor=self.line, padding=(12, 10), font=("Segoe UI", 11))
         style.map("TEntry", bordercolor=[("focus", self.accent)], lightcolor=[("focus", self.accent)], darkcolor=[("focus", self.accent)])
-        style.configure("TButton", padding=(12, 8), font=("Segoe UI", 10))
-        style.map("TButton", background=[("active", self.accent), ("pressed", self.accent)], foreground=[("active", "white"), ("pressed", "white")])
-        style.configure("Nav.TButton", padding=(11, 10), anchor="e", background=self.panel, foreground=self.fg)
-        style.map("Nav.TButton", background=[("active", self.accent)], foreground=[("active", "white")])
-        style.configure("Accent.TButton", padding=(12, 8), background=self.accent, foreground="white", font=("Segoe UI", 10, "bold"))
-        style.map("Accent.TButton", background=[("active", self.accent), ("pressed", self.accent)], foreground=[("active", "white"), ("pressed", "white")])
-        style.configure("Treeview", rowheight=38, background=self.panel, fieldbackground=self.panel, foreground=self.fg, borderwidth=0, font=("Segoe UI", 10))
-        style.configure("Treeview.Heading", background=self.accent, foreground="white", font=("Segoe UI", 10, "bold"))
+        style.configure("TCombobox", fieldbackground=self.panel, background=self.panel, foreground=self.fg, bordercolor=self.line, lightcolor=self.line, darkcolor=self.line, arrowsize=16, padding=(12, 10))
+        style.map("TCombobox", fieldbackground=[("readonly", self.panel)], bordercolor=[("focus", self.accent)], lightcolor=[("focus", self.accent)], darkcolor=[("focus", self.accent)])
+        style.configure("TRadiobutton", background=self.panel, foreground=self.fg, padding=7)
+        style.configure("TButton", padding=(14, 10), relief="flat", borderwidth=0, font=("Segoe UI", 11, "bold"), background="#e7f0f4" if not self.dark else "#1a3044", foreground=self.fg)
+        style.map("TButton", background=[("active", "#d4e6ec" if not self.dark else "#25455b"), ("pressed", "#c6dde6" if not self.dark else "#2a4e66")])
+        style.configure("Nav.TButton", padding=(14, 12), anchor="e", relief="flat", borderwidth=0, background=self.sidebar_bg, foreground="#c9dbe5", font=("Segoe UI", 11))
+        style.map("Nav.TButton", background=[("active", "#12384b"), ("pressed", "#17485d")], foreground=[("active", "white"), ("pressed", "white")])
+        style.configure("NavActive.TButton", padding=(14, 12), anchor="e", relief="flat", borderwidth=0, background=self.accent, foreground="white", font=("Segoe UI", 11, "bold"))
+        style.map("NavActive.TButton", background=[("active", "#056b76"), ("pressed", "#045762")], foreground=[("active", "white"), ("pressed", "white")])
+        style.configure("Accent.TButton", padding=(14, 10), relief="flat", borderwidth=0, background=self.accent, foreground="white", font=("Segoe UI", 11, "bold"))
+        style.map("Accent.TButton", background=[("active", self.button_hover), ("pressed", "#045762")])
+        style.configure("Primary.TButton", padding=(14, 10), relief="flat", borderwidth=0, background="#087f8c", foreground="white", font=("Segoe UI", 11, "bold"))
+        style.map("Primary.TButton", background=[("active", "#056b76"), ("pressed", "#045762")])
+        style.configure("Success.TButton", padding=(14, 10), relief="flat", borderwidth=0, background="#059669", foreground="white", font=("Segoe UI", 11, "bold"))
+        style.map("Success.TButton", background=[("active", "#047857"), ("pressed", "#065f46")])
+        style.configure("Danger.TButton", padding=(14, 10), relief="flat", borderwidth=0, background="#dc2626", foreground="white", font=("Segoe UI", 11, "bold"))
+        style.map("Danger.TButton", background=[("active", "#b91c1c"), ("pressed", "#991b1b")])
+        style.configure("Warning.TButton", padding=(14, 10), relief="flat", borderwidth=0, background="#d97706", foreground="white", font=("Segoe UI", 11, "bold"))
+        style.map("Warning.TButton", background=[("active", "#b45309"), ("pressed", "#92400e")])
+        density = self.store.setting("row_density", "comfortable")
+        row_height = {"compact": 34, "spacious": 50}.get(density, 42)
+        style.configure("Treeview", rowheight=row_height, background=self.panel, fieldbackground=self.panel, foreground=self.fg, borderwidth=0, font=("Segoe UI", 11))
+        style.configure("Treeview.Heading", padding=(10, 12), background=self.sidebar_bg, foreground="white", font=("Segoe UI", 11, "bold"), relief="flat")
+        style.map("Treeview.Heading", background=[("active", "#1e3a5f")])
         style.map("Treeview", background=[("selected", self.accent)], foreground=[("selected", "white")])
         style.configure("TScrollbar", background=self.panel, troughcolor=self.bg, bordercolor=self.bg, arrowcolor=self.fg)
         style.configure("TSeparator", background=self.line)
+        self.root.option_add("*Toplevel.background", self.bg)
         self.root.configure(bg=self.bg)
 
+    def center_window(self, window, width, height):
+        window.update_idletasks()
+        try:
+            root_x = self.root.winfo_rootx()
+            root_y = self.root.winfo_rooty()
+            root_width = self.root.winfo_width()
+            root_height = self.root.winfo_height()
+            x = root_x + max(0, (root_width - width) // 2)
+            y = root_y + max(0, (root_height - height) // 2)
+            window.geometry(f"{width}x{height}+{x}+{y}")
+        except tk.TclError:
+            window.geometry(f"{width}x{height}")
+
     def show_login(self):
+        if hasattr(self, "login_bg") and self.login_bg.winfo_exists():
+            self.login_bg.destroy()
+        self.login_bg = tk.Canvas(
+            self.root,
+            background="#edf4ff",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.login_bg.place(x=0, y=0, relwidth=1, relheight=1)
+
+        def paint_login_background(_event=None):
+            width = max(1, self.login_bg.winfo_width())
+            height = max(1, self.login_bg.winfo_height())
+            self.login_bg.delete("all")
+            start = (238, 247, 249)
+            end = (213, 232, 237)
+            for index in range(height):
+                ratio = index / max(1, height - 1)
+                color = (
+                    int(start[channel] + (end[channel] - start[channel]) * ratio)
+                    for channel in range(3)
+                )
+                rgb = tuple(color)
+                self.login_bg.create_line(
+                    0,
+                    index,
+                    width,
+                    index,
+                    fill="#%02x%02x%02x" % rgb,
+                )
+            self.login_bg.create_oval(
+                width * 0.72,
+                -height * 0.12,
+                width * 1.05,
+                height * 0.28,
+                fill="#caedf0",
+                outline="#caedf0",
+            )
+            self.login_bg.create_oval(
+                -width * 0.06,
+                height * 0.68,
+                width * 0.24,
+                height * 1.03,
+                fill="#d6edf0",
+                outline="#d6edf0",
+            )
+
+        self.login_bg.bind("<Configure>", paint_login_background)
+        paint_login_background()
+        self.login_bg.tk.call("lower", str(self.login_bg))
+
         self.login = ttk.Frame(self.root, padding=4)
         self.login.place(relx=.5, rely=.5, anchor="center")
-        card = ttk.Frame(self.login, padding=32, style="Login.TFrame")
+        card = ttk.Frame(self.login, padding=(44, 38), style="Login.TFrame")
         card.pack()
-        brand = tk.Frame(card, bg=self.accent, padx=18, pady=12)
-        brand.pack(fill="x", pady=(0, 18))
+        card.configure(width=480)
+        brand = tk.Frame(card, bg="#087f8c", padx=24, pady=20, highlightthickness=1, highlightbackground="#5cc7d1")
+        brand.pack(fill="x", pady=(0, 20))
         tk.Label(
             brand,
             text=f"🏥  {self.hospital_name}",
@@ -1247,38 +1632,116 @@ class HospitalApp:
             fg="white",
             font=("Segoe UI", 18, "bold"),
         ).pack(anchor="center")
-        ttk.Label(card, text="تسجيل الدخول إلى التطبيق المحلي", font=("Segoe UI", 11)).pack(pady=(0, 8))
-        self.username_var = tk.StringVar(value="admin")
+        ttk.Label(card, text="تسجيل الدخول إلى التطبيق المحلي", font=("Segoe UI", 12, "bold")).pack(pady=(0, 3))
+        ttk.Label(card, text="إدارة آمنة ومنظمة لعمليات المشفى اليومية", style="Muted.TLabel").pack(pady=(0, 8))
+        self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
-        ttk.Label(card, text="اسم المستخدم").pack(anchor="e", pady=(12, 4))
+        ttk.Label(card, text="اسم المستخدم", font=("Segoe UI", 10, "bold")).pack(anchor="e", pady=(14, 6))
         self.username_entry = ttk.Entry(card, textvariable=self.username_var, width=34)
-        self.username_entry.pack(ipady=4)
-        ttk.Label(card, text="كلمة المرور").pack(anchor="e", pady=(12, 4))
+        self.username_entry.pack(fill="x", ipady=4)
+        ttk.Label(card, text="كلمة المرور", font=("Segoe UI", 10, "bold")).pack(anchor="e", pady=(14, 6))
         self.password_entry = ttk.Entry(card, textvariable=self.password_var, show="*", width=34)
-        self.password_entry.pack(ipady=4)
-        ttk.Button(card, text="تسجيل الدخول", command=self.login_user, style="Accent.TButton").pack(fill="x", pady=(18, 12), ipady=3)
+        self.password_entry.pack(fill="x", ipady=4)
+        show_password_var = tk.BooleanVar(value=False)
+
+        def toggle_password():
+            self.password_entry.configure(show="" if show_password_var.get() else "*")
+
+        ttk.Checkbutton(
+            card,
+            text="إظهار كلمة المرور",
+            variable=show_password_var,
+            command=toggle_password,
+        ).pack(anchor="e", pady=(6, 0))
+        ttk.Button(card, text="تسجيل الدخول", command=self.login_user, style="Primary.TButton").pack(fill="x", pady=(20, 12), ipady=5)
         ttk.Label(
             card,
-            text="حسابات تجريبية: admin / doctor / reception — كلمة المرور 1234",
+            text=self.label_text("لا توجد بيانات دخول افتراضية. أنشئ حساب المدير عند التشغيل الأول."),
             style="Muted.TLabel",
             wraplength=420,
             justify="center",
         ).pack(pady=(2, 0))
+        if self.store.account_count() == 0:
+            ttk.Button(
+                card,
+                text=self.label_text("إنشاء حساب المدير الأول"),
+                command=self.open_initial_admin_setup,
+                style="Success.TButton",
+            ).pack(fill="x", pady=(12, 0))
+        self.username_entry.bind("<Return>", lambda _event: self.password_entry.focus_set())
         self.password_entry.bind("<Return>", lambda _event: self.login_user())
         self.username_entry.focus_set()
 
+    def open_initial_admin_setup(self):
+        if self.store.account_count():
+            messagebox.showinfo("إعداد الحساب", "تم إنشاء حساب بالفعل. سجّل الدخول بحساب مدير.")
+            return
+        window = tk.Toplevel(self.root)
+        window.title(self.label_text("إنشاء حساب المدير الأول"))
+        window.transient(self.root)
+        window.grab_set()
+        form = ttk.Frame(window, padding=22)
+        form.pack(fill="both", expand=True)
+        ttk.Label(form, text=self.label_text("أنشئ بيانات دخول فريدة للمسؤول الأول.")).grid(row=0, column=0, columnspan=2, sticky="e", pady=(0, 10))
+        fields = {}
+        for row, (key, label, hidden) in enumerate((
+            ("username", "اسم المستخدم", False),
+            ("display_name", "الاسم الظاهر", False),
+            ("password", "كلمة المرور (12 حرفاً على الأقل)", True),
+            ("confirm", "تأكيد كلمة المرور", True),
+        ), start=1):
+            ttk.Label(form, text=self.label_text(label)).grid(row=row, column=1, sticky="e", padx=(10, 0), pady=5)
+            variable = tk.StringVar()
+            entry = ttk.Entry(form, textvariable=variable, show="*" if hidden else "")
+            entry.grid(row=row, column=0, sticky="ew", pady=5)
+            fields[key] = variable
+        form.columnconfigure(0, weight=1)
+
+        def create_admin():
+            password = fields["password"].get()
+            if password != fields["confirm"].get():
+                messagebox.showerror("تعذر إنشاء الحساب", "كلمتا المرور غير متطابقتين", parent=window)
+                return
+            try:
+                self.store.create_user(
+                    fields["username"].get(),
+                    fields["display_name"].get(),
+                    "admin",
+                    password,
+                )
+            except (ValueError, sqlite3.IntegrityError) as exc:
+                messagebox.showerror("تعذر إنشاء الحساب", str(exc), parent=window)
+                return
+            self.username_var.set(fields["username"].get().strip())
+            window.destroy()
+            messagebox.showinfo("تم إنشاء الحساب", "تم إنشاء حساب المدير. سجّل الدخول بكلمة المرور الجديدة.")
+
+        ttk.Button(form, text=self.label_text("إنشاء الحساب"), command=create_admin, style="Success.TButton").grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0)
+        )
+        ttk.Button(form, text=self.label_text("عودة"), command=window.destroy).grid(
+            row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0)
+        )
+        self.center_window(window, 560, 330)
+
     def login_user(self):
         username = self.username_var.get().strip()
-        account = USERS.get(username)
-        if not account or account[0] != self.password_var.get():
+        account = self.store.authenticate_user(username, self.password_var.get())
+        if not account:
+            self.password_var.set("")
             messagebox.showerror("تعذر الدخول", "اسم المستخدم أو كلمة المرور غير صحيحة")
+            self.password_entry.focus_set()
             return
-        self.user_name, self.role = account[1], account[2]
+        self.user_name, self.role = account["name"], account["role"]
+        self.username = account["username"]
         self.login.destroy()
+        if hasattr(self, "login_bg") and self.login_bg.winfo_exists():
+            self.login_bg.destroy()
         self.build_main()
         self.audit("تسجيل دخول")
         self.notify(f"مرحباً {self.user_name}")
         self.check_reminders()
+        self.check_device_alerts()
 
     def logout(self):
         self.audit("تسجيل خروج")
@@ -1287,7 +1750,7 @@ class HospitalApp:
                 child.destroy()
         if hasattr(self, "shell") and self.shell.winfo_exists():
             self.shell.destroy()
-        self.user_name, self.role = "", ""
+        self.user_name, self.username, self.role = "", "", ""
         self.page_history.clear()
         self.root.unbind("<Control-k>")
         self.root.unbind("<Control-K>")
@@ -1298,86 +1761,171 @@ class HospitalApp:
 
     def build_main(self):
         self.root.title(self.hospital_name)
+        self.root.minsize(1100, 680)
+        self.root.configure(bg=self.bg)
+        if hasattr(self, "login_bg") and self.login_bg.winfo_exists():
+            self.login_bg.destroy()
         shell = ttk.Frame(self.root)
         shell.pack(fill="both", expand=True)
         self.shell = shell
-        self.sidebar = ttk.Frame(shell, padding=(8, 12), style="Panel.TFrame")
-        self.sidebar.pack(side="right", fill="y", padx=(0, 6))
-        brand = tk.Frame(self.sidebar, bg=self.accent, padx=8, pady=9)
-        brand.pack(fill="x", pady=(0, 12))
+        self.sidebar = ttk.Frame(shell, padding=(14, 18), style="Sidebar.TFrame", width=292)
+        self.sidebar.pack(side="right", fill="y")
+        self.sidebar.pack_propagate(False)
+        self.sidebar_visible = True
+        brand = tk.Frame(self.sidebar, bg="#087f8c", padx=16, pady=18, highlightthickness=1, highlightbackground="#33a8b3")
+        brand.pack(fill="x", pady=(0, 18))
         tk.Label(
             brand,
             text=self.hospital_name,
             bg=self.accent,
             fg="white",
             font=("Segoe UI", 12, "bold"),
-            wraplength=175,
+            wraplength=190,
             justify="center",
         ).pack(fill="x")
-        navigation = ttk.Frame(self.sidebar, style="Panel.TFrame")
+        tk.Label(
+            brand,
+            text="HOSPITAL OPERATIONS" if self.language == "en" else "إدارة المشفى",
+            bg=self.accent,
+            fg="#dbeafe",
+            font=("Segoe UI", 8, "bold"),
+        ).pack(pady=(5, 0))
+        navigation = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
         navigation.pack(fill="both", expand=True)
-        self.nav_canvas = tk.Canvas(navigation, width=220, background=self.panel, highlightthickness=0, borderwidth=0)
+        self.nav_canvas = tk.Canvas(navigation, width=260, background=self.sidebar_bg, highlightthickness=0, borderwidth=0)
         nav_scrollbar = ttk.Scrollbar(navigation, orient="vertical", command=self.nav_canvas.yview)
         self.nav_canvas.configure(yscrollcommand=nav_scrollbar.set)
         nav_scrollbar.pack(side="left", fill="y")
         self.nav_canvas.pack(side="right", fill="both", expand=True)
-        self.nav_frame = ttk.Frame(self.nav_canvas, style="Panel.TFrame")
+        self.nav_frame = ttk.Frame(self.nav_canvas, style="Sidebar.TFrame")
         self.nav_window = self.nav_canvas.create_window((0, 0), window=self.nav_frame, anchor="nw")
         self.nav_frame.bind("<Configure>", lambda _event: self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all")))
         self.nav_canvas.bind("<Configure>", lambda event: self.nav_canvas.itemconfigure(self.nav_window, width=event.width))
         self.nav_canvas.bind("<Enter>", self.bind_navigation_wheel)
         self.nav_canvas.bind("<Leave>", self.unbind_navigation_wheel)
         self.nav_buttons = {}
-        self.content = ttk.Frame(shell, padding=(14, 12, 12, 10))
+        self.content = ttk.Frame(shell, padding=(26, 20, 26, 18))
         self.content.pack(side="left", fill="both", expand=True)
-        self.header = ttk.Frame(self.content, style="Panel.TFrame", padding=(10, 8))
-        self.header.pack(fill="x", pady=(0, 10))
-        self.page_title = ttk.Label(self.header, text="", style="Panel.TLabel", font=("Segoe UI", 19, "bold"))
-        self.page_title.pack(side="right", padx=8)
-        self.user_label = ttk.Label(self.header, text=f"{self.user_name} — {self.label_text(self.role_label())}", style="Panel.TLabel")
-        self.user_label.pack(side="left", padx=8)
-        ttk.Button(self.header, text=self.label_text("رجوع"), command=self.go_back).pack(side="right", padx=4)
-        ttk.Button(self.header, text=self.label_text("تسجيل خروج"), command=self.logout).pack(side="left", padx=4)
-        toolbar = ttk.Frame(self.content)
-        toolbar.pack(fill="x", pady=(0, 10))
+        menu_strip = tk.Frame(
+            self.content,
+            bg=self.header_bg,
+            height=58,
+            highlightthickness=1,
+            highlightbackground=self.line,
+        )
+        menu_strip.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            menu_strip,
+            text=f"✚  {self.hospital_name}",
+            bg=self.header_bg,
+            fg=self.fg,
+            font=("Segoe UI", 13, "bold"),
+        ).pack(side="right", padx=14)
+        tk.Label(
+            menu_strip,
+            text="نظام المشفى الذكي",
+            bg=self.header_bg,
+            fg=self.muted,
+            font=("Segoe UI", 9),
+        ).pack(side="right", padx=(0, 10))
+        self.chrome_button = ttk.Button(
+            menu_strip,
+            text="☰  القائمة",
+            command=self.toggle_chrome,
+            style="Primary.TButton",
+        )
+        self.chrome_button.pack(side="right", padx=2)
+        ttk.Button(
+            menu_strip,
+            text="🔔 التنبيهات",
+            command=self.open_notification_center,
+            style="Warning.TButton",
+        ).pack(side="right", padx=4)
+        ttk.Button(
+            menu_strip,
+            text="الإعدادات",
+            command=self.open_settings_center,
+            style="TButton",
+        ).pack(side="left", padx=3)
+        tk.Label(
+            menu_strip,
+            text="● النظام متصل",
+            bg=self.header_bg,
+            fg="#059669",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left", padx=12)
+        tk.Frame(self.content, bg=self.accent, height=3).pack(fill="x", pady=(0, 10))
+        self.header = tk.Frame(self.content, bg=self.header_bg, padx=18, pady=14, highlightthickness=1, highlightbackground=self.line)
+        self.header.pack(fill="x", pady=(0, 12))
+        self.header_visible = True
+        title_block = tk.Frame(self.header, bg=self.header_bg)
+        title_block.pack(side="right", fill="x", expand=True)
+        tk.Label(title_block, text="", bg=self.header_bg, fg=self.fg, font=("Segoe UI", 21, "bold"), anchor="e").pack(anchor="e")
+        self.page_title = title_block.winfo_children()[0]
+        tk.Label(title_block, text=f"{self.user_name} — {self.label_text(self.role_label())}", bg=self.header_bg, fg=self.muted, font=("Segoe UI", 10), anchor="e").pack(anchor="e", pady=(4, 0))
+        self.user_label = title_block.winfo_children()[1]
+        if self.role == "admin":
+            ttk.Button(
+                self.header,
+                text=self.label_text("إدارة المستخدمين"),
+                command=self.open_user_manager,
+                style="Primary.TButton",
+            ).pack(side="left", padx=4)
+        ttk.Button(self.header, text=self.label_text("تسجيل خروج"), command=self.logout, style="Danger.TButton").pack(side="left", padx=4)
+        ttk.Button(self.header, text=self.label_text("رجوع"), command=self.go_back, style="TButton").pack(side="left", padx=4)
+        toolbar = tk.Frame(self.content, bg=self.panel, padx=14, pady=11, highlightthickness=1, highlightbackground=self.line)
+        toolbar.pack(fill="x", pady=(0, 12))
         self.toolbar = toolbar
-        self.search_entry = ttk.Entry(toolbar, textvariable=self.search_var, width=28)
-        self.search_entry.pack(side="right", padx=4)
+        search_row = tk.Frame(toolbar, bg=self.panel)
+        search_row.pack(fill="x", pady=(0, 9))
+        tk.Label(search_row, text=self.label_text("بحث سريع"), bg=self.panel, fg=self.fg, padx=6, font=("Segoe UI", 10, "bold")).pack(side="right")
+        self.search_entry = ttk.Entry(search_row, textvariable=self.search_var, width=42)
+        self.search_entry.pack(side="right", padx=5, ipady=2)
         self.search_entry.configure(foreground=self.fg)
         self.search_entry.bind("<Return>", lambda _event: self.show_global_search())
         self.search_entry.bind("<Control-a>", lambda event: self.select_all_text(event))
-        ttk.Button(toolbar, text="×", width=3, command=lambda: self.search_var.set("")).pack(side="right", padx=(0, 4))
-        ttk.Button(toolbar, text=self.label_text("بحث"), command=self.show_global_search).pack(side="right")
-        ttk.Button(toolbar, text=self.label_text("🌙 / ☀️"), command=self.toggle_theme).pack(side="left", padx=3)
-        ttk.Button(toolbar, text=self.label_text("عربي / English"), command=self.toggle_language).pack(side="left", padx=3)
-        ttk.Button(toolbar, text=self.label_text("📥 نسخة احتياطية"), command=self.export_backup).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="تقييم المراجع", command=self.open_feedback_kiosk).pack(side="left", padx=3)
+        ttk.Button(search_row, text="×", width=3, command=lambda: self.search_var.set(""), style="TButton").pack(side="right", padx=(0, 4))
+        ttk.Button(search_row, text=self.label_text("بحث"), command=self.show_global_search, style="Primary.TButton").pack(side="right")
+        actions_row = tk.Frame(toolbar, bg=self.panel)
+        actions_row.pack(fill="x")
+        ttk.Button(actions_row, text=self.label_text("🌙 / ☀️"), command=self.toggle_theme).pack(side="left", padx=3)
+        ttk.Button(actions_row, text=self.label_text("عربي / English"), command=self.toggle_language).pack(side="left", padx=3)
+        ttk.Button(actions_row, text=self.label_text("📥 نسخة احتياطية"), command=self.export_backup).pack(side="left", padx=3)
+        ttk.Button(actions_row, text="تقييم المراجع", command=self.open_feedback_kiosk).pack(side="left", padx=3)
         if self.role == "admin":
-            ttk.Button(toolbar, text=self.label_text("استعادة"), command=self.import_backup).pack(side="left", padx=3)
-            ttk.Button(toolbar, text=self.label_text("هوية المشفى"), command=self.customize_brand).pack(side="left", padx=3)
+            ttk.Button(actions_row, text=self.label_text("استعادة"), command=self.import_backup).pack(side="left", padx=3)
+            ttk.Button(actions_row, text=self.label_text("هوية المشفى"), command=self.customize_brand).pack(side="left", padx=3)
             emergency_text = "إنهاء وضع الطوارئ" if self.store.setting("emergency_mode") == "1" else "تفعيل وضع الطوارئ"
-            self.emergency_button = ttk.Button(toolbar, text=emergency_text, command=self.toggle_emergency_mode)
+            self.emergency_button = ttk.Button(actions_row, text=emergency_text, command=self.toggle_emergency_mode)
             self.emergency_button.pack(side="left", padx=3)
         self.body = ttk.Frame(self.content)
         self.body.pack(fill="both", expand=True)
-        self.table_count_label = ttk.Label(self.content, text="")
-        self.table_count_label.pack(anchor="e", pady=(5, 0))
-        self.status_label = ttk.Label(self.content, text="💾 قاعدة بيانات محلية على هذا الجهاز")
-        self.status_label.pack(fill="x", pady=(8, 0))
+        self.table_count_label = ttk.Label(self.content, text="", style="Muted.TLabel")
+        self.table_count_label.pack(anchor="e", pady=(8, 0))
+        self.status_label = ttk.Label(self.content, text="💾 قاعدة بيانات محلية على هذا الجهاز", style="Muted.TLabel")
+        self.status_label.pack(fill="x", pady=(10, 0))
+        ttk.Label(self.nav_frame, text=self.label_text("التنقل"), style="Section.TLabel").pack(anchor="e", padx=8, pady=(2, 8))
+        if self.role == "admin":
+            ttk.Button(
+                self.nav_frame,
+                text=f"＋  {self.label_text('إدارة الحسابات')}",
+                style="Nav.TButton",
+                command=self.open_user_manager,
+            ).pack(fill="x", pady=(0, 8))
         for key, page in PAGES.items():
             if not self.can_view(key):
                 continue
             title = str(self.page_title_text(key, page["title"]))
             button = ttk.Button(self.nav_frame, text=title, style="Nav.TButton", command=lambda item=key: self.show_page(item))
-            button.pack(fill="x", pady=3)
+            button.pack(fill="x", pady=2)
             self.nav_buttons[key] = button
         ttk.Separator(self.nav_frame, orient="horizontal").pack(fill="x", pady=8)
-        ttk.Label(self.nav_frame, text="العيادات", style="Panel.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor="e", pady=(2, 4))
+        ttk.Label(self.nav_frame, text="العيادات", style="Sidebar.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor="e", pady=(2, 4))
         for clinic in self.store.list("clinics"):
             clinic_key = f"clinic:{clinic['id']}"
             if not self.can_view(clinic_key):
                 continue
-            clinic_row = ttk.Frame(self.nav_frame, style="Panel.TFrame")
+            clinic_row = ttk.Frame(self.nav_frame, style="Sidebar.TFrame")
             clinic_row.pack(fill="x", pady=2)
             button = ttk.Button(
                 clinic_row,
@@ -1402,8 +1950,43 @@ class HospitalApp:
         self.root.bind("<Control-n>", self.add_current)
         self.root.bind("<Control-N>", self.add_current)
         self.root.bind("<Escape>", self.close_dialog)
+        self.root.bind("<F1>", lambda _event: self.toggle_chrome())
         self.show_page("dashboard")
+        if self.store.setting("sidebar_default", "collapsed") == "open":
+            self.show_chrome()
+        else:
+            self.hide_chrome()
         self.root.after(30000, self.reminder_tick)
+
+    def toggle_chrome(self):
+        if getattr(self, "chrome_visible", False):
+            self.hide_chrome()
+        else:
+            self.show_chrome()
+
+    def show_chrome(self):
+        if hasattr(self, "sidebar") and self.sidebar.winfo_exists():
+            self.sidebar.pack(side="right", fill="y")
+            self.sidebar_visible = True
+        if hasattr(self, "header") and self.header.winfo_exists():
+            self.header.pack(fill="x", pady=(0, 12), before=self.body)
+            self.header_visible = True
+        if hasattr(self, "toolbar") and self.toolbar.winfo_exists():
+            self.toolbar.pack(fill="x", pady=(0, 12), before=self.body)
+        self.chrome_visible = True
+        self.chrome_button.configure(text="×  إخفاء")
+
+    def hide_chrome(self):
+        if hasattr(self, "sidebar") and self.sidebar.winfo_exists():
+            self.sidebar.pack_forget()
+            self.sidebar_visible = False
+        if hasattr(self, "header") and self.header.winfo_exists():
+            self.header.pack_forget()
+            self.header_visible = False
+        if hasattr(self, "toolbar") and self.toolbar.winfo_exists():
+            self.toolbar.pack_forget()
+        self.chrome_visible = False
+        self.chrome_button.configure(text="☰  القائمة")
 
     def bind_navigation_wheel(self, _event=None):
         self.nav_canvas.bind_all("<MouseWheel>", self.scroll_navigation)
@@ -1428,8 +2011,260 @@ class HospitalApp:
     def role_label(self):
         return {"admin": "مدير", "doctor": "طبيب", "reception": "استقبال"}.get(self.role, "")
 
+    def open_user_manager(self):
+        if self.role != "admin":
+            self.notify("لا تملك صلاحية إدارة المستخدمين", "error")
+            return
+        window = tk.Toplevel(self.root)
+        window.title(self.label_text("إدارة المستخدمين"))
+        window.geometry("760x500")
+        window.transient(self.root)
+        window.grab_set()
+        container = ttk.Frame(window, padding=18)
+        container.pack(fill="both", expand=True)
+        ttk.Label(container, text=self.label_text("إنشاء حسابات الموظفين وإيقاف الحسابات غير النشطة.")).pack(anchor="e")
+        columns = ("username", "display_name", "role", "active")
+        table = ttk.Treeview(container, columns=columns, show="headings", selectmode="browse", height=10)
+        headings = {
+            "username": self.label_text("اسم المستخدم"),
+            "display_name": self.label_text("الاسم"),
+            "role": self.label_text("الدور"),
+            "active": self.label_text("الحالة"),
+        }
+        for column in columns:
+            table.heading(column, text=headings[column])
+            table.column(column, anchor="center", width=150)
+        table.pack(fill="both", expand=True, pady=(10, 8))
+
+        def refresh_accounts():
+            table.delete(*table.get_children())
+            for account in self.store.list_user_accounts():
+                table.insert(
+                    "",
+                    "end",
+                    iid=account["username"],
+                    values=(
+                        account["username"],
+                        account["display_name"],
+                        self.label_text(self.role_label_for(account["role"])),
+                        "نشط" if account["active"] else "موقوف",
+                    ),
+                )
+
+        form = ttk.LabelFrame(container, text=self.label_text("حساب جديد"), padding=10)
+        form.pack(fill="x")
+        username_var = tk.StringVar()
+        display_name_var = tk.StringVar()
+        role_var = tk.StringVar(value="طبيب")
+        password_var = tk.StringVar()
+        for column, (label, variable, show) in enumerate((
+            ("اسم المستخدم", username_var, ""),
+            ("الاسم الظاهر", display_name_var, ""),
+            ("الدور", role_var, None),
+            ("كلمة المرور (12 حرفاً على الأقل)", password_var, "*"),
+        )):
+            ttk.Label(form, text=self.label_text(label)).grid(row=0, column=column, sticky="e", padx=4)
+            if show is None:
+                widget = ttk.Combobox(
+                    form,
+                    textvariable=variable,
+                    values=("مدير", "طبيب", "استقبال"),
+                    state="readonly",
+                    width=12,
+                )
+            else:
+                widget = ttk.Entry(form, textvariable=variable, show=show, width=20)
+            widget.grid(row=1, column=column, sticky="ew", padx=4, pady=(4, 8))
+            form.columnconfigure(column, weight=1)
+
+        def add_account():
+            try:
+                self.store.create_user(
+                    username_var.get(),
+                    display_name_var.get(),
+                    {"مدير": "admin", "طبيب": "doctor", "استقبال": "reception"}[role_var.get()],
+                    password_var.get(),
+                    self.user_name,
+                )
+            except (ValueError, sqlite3.IntegrityError) as exc:
+                messagebox.showerror("تعذر إنشاء الحساب", str(exc), parent=window)
+                return
+            created_username = username_var.get().strip()
+            username_var.set("")
+            display_name_var.set("")
+            password_var.set("")
+            refresh_accounts()
+            messagebox.showinfo(
+                "تم إنشاء الحساب",
+                f"تم إنشاء الحساب {created_username} كحساب نشط ويمكن استخدامه لتسجيل الدخول.",
+                parent=window,
+            )
+
+        def open_bulk_creator():
+            bulk = tk.Toplevel(window)
+            bulk.title(self.label_text("إنشاء عدة حسابات"))
+            bulk.geometry("520x270")
+            bulk.transient(window)
+            bulk.grab_set()
+            panel = ttk.Frame(bulk, padding=18)
+            panel.pack(fill="both", expand=True)
+
+            count_var = tk.StringVar(value="5")
+            prefix_var = tk.StringVar(value="موظف")
+            role_var_bulk = tk.StringVar(value="استقبال")
+            password_var_bulk = tk.StringVar()
+
+            ttk.Label(panel, text=self.label_text("عدد الحسابات")).grid(row=0, column=0, sticky="e", padx=5)
+            count_entry = ttk.Spinbox(panel, from_=1, to=100, textvariable=count_var, width=10)
+            count_entry.grid(row=0, column=1, sticky="w", padx=5)
+
+            ttk.Label(panel, text=self.label_text("بادئة اسم المستخدم")).grid(row=1, column=0, sticky="e", padx=5)
+            ttk.Entry(panel, textvariable=prefix_var, width=24).grid(row=1, column=1, sticky="w", padx=5, pady=6)
+
+            ttk.Label(panel, text=self.label_text("الدور")).grid(row=2, column=0, sticky="e", padx=5)
+            ttk.Combobox(
+                panel,
+                textvariable=role_var_bulk,
+                values=("مدير", "طبيب", "استقبال"),
+                state="readonly",
+                width=21,
+            ).grid(row=2, column=1, sticky="w", padx=5)
+
+            ttk.Label(panel, text=self.label_text("كلمة مرور مشتركة")).grid(row=3, column=0, sticky="e", padx=5)
+            ttk.Entry(panel, textvariable=password_var_bulk, show="*", width=24).grid(
+                row=3, column=1, sticky="w", padx=5, pady=6
+            )
+            ttk.Label(
+                panel,
+                text=self.label_text("ستُنشأ أسماء المستخدمين staff1 أو الموظف1 حسب البادئة، وتكون أسماؤها الظاهرة متتابعة."),
+                wraplength=460,
+                foreground="#64748b",
+            ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 8))
+
+            def create_bulk_accounts():
+                try:
+                    count = int(count_var.get())
+                    if not 1 <= count <= 100:
+                        raise ValueError("يجب أن يكون عدد الحسابات بين 1 و100")
+                    prefix = prefix_var.get().strip()
+                    if not prefix:
+                        raise ValueError("أدخل بادئة اسم المستخدم")
+                    role = {"مدير": "admin", "طبيب": "doctor", "استقبال": "reception"}[role_var_bulk.get()]
+                    password = password_var_bulk.get()
+                    accounts = [
+                        {
+                            "username": f"{prefix}{index}",
+                            "display_name": f"{prefix} {index}",
+                            "role": role,
+                            "password": password,
+                        }
+                        for index in range(1, count + 1)
+                    ]
+                    self.store.create_users(accounts, self.user_name)
+                except (ValueError, sqlite3.IntegrityError) as exc:
+                    messagebox.showerror("تعذر إنشاء الحسابات", str(exc), parent=bulk)
+                    return
+                refresh_accounts()
+                bulk.destroy()
+                messagebox.showinfo(
+                    "تم إنشاء الحسابات",
+                    f"تم إنشاء {count} حسابات نشطة بالدور المحدد.",
+                    parent=window,
+                )
+
+            ttk.Button(
+                panel,
+                text=self.label_text("إنشاء الحسابات"),
+                command=create_bulk_accounts,
+                style="Success.TButton",
+            ).grid(row=5, column=1, sticky="e", pady=(8, 0))
+            ttk.Button(panel, text=self.label_text("إلغاء"), command=bulk.destroy).grid(
+                row=5, column=0, sticky="w", pady=(8, 0)
+            )
+
+        def deactivate_account():
+            selected = table.selection()
+            if not selected:
+                messagebox.showinfo("إيقاف الحساب", "اختر حساباً من القائمة أولاً.", parent=window)
+                return
+            selected_username = selected[0]
+            if selected_username == self.username:
+                messagebox.showerror("إيقاف الحساب", "لا يمكن إيقاف الحساب المستخدم حالياً.", parent=window)
+                return
+            try:
+                self.store.set_user_active(selected_username, False, self.user_name)
+            except ValueError as exc:
+                messagebox.showerror("تعذر إيقاف الحساب", str(exc), parent=window)
+                return
+            refresh_accounts()
+
+        def activate_account():
+            selected = table.selection()
+            if not selected:
+                messagebox.showinfo("تفعيل الحساب", "اختر حساباً من القائمة أولاً.", parent=window)
+                return
+            try:
+                self.store.set_user_active(selected[0], True, self.user_name)
+            except ValueError as exc:
+                messagebox.showerror("تعذر تفعيل الحساب", str(exc), parent=window)
+                return
+            refresh_accounts()
+            messagebox.showinfo("تم التفعيل", "تم تفعيل الحساب ويمكنه تسجيل الدخول الآن.", parent=window)
+
+        def reset_password():
+            selected = table.selection()
+            if not selected:
+                messagebox.showinfo("إعادة تعيين كلمة المرور", "اختر حساباً من القائمة أولاً.", parent=window)
+                return
+            try:
+                self.store.change_user_password(selected[0], password_var.get(), self.user_name)
+            except ValueError as exc:
+                messagebox.showerror("تعذر تغيير كلمة المرور", str(exc), parent=window)
+                return
+            password_var.set("")
+            messagebox.showinfo("تم تغيير كلمة المرور", "تم تحديث كلمة المرور للحساب المحدد.", parent=window)
+
+        def delete_account():
+            selected = table.selection()
+            if not selected:
+                messagebox.showinfo("حذف الحساب", "اختر حساباً من القائمة أولاً.", parent=window)
+                return
+            selected_username = selected[0]
+            if selected_username == self.username:
+                messagebox.showerror("حذف الحساب", "لا يمكن حذف الحساب المسجل فيه حالياً.", parent=window)
+                return
+            if not messagebox.askyesno(
+                "تأكيد حذف الحساب",
+                f"هل تريد حذف حساب «{selected_username}» نهائياً؟",
+                parent=window,
+            ):
+                return
+            try:
+                self.store.delete_user(selected_username, self.user_name)
+            except ValueError as exc:
+                messagebox.showerror("تعذر حذف الحساب", str(exc), parent=window)
+                return
+            refresh_accounts()
+            messagebox.showinfo("تم حذف الحساب", "تم حذف الحساب نهائياً.", parent=window)
+
+        actions = ttk.Frame(container)
+        actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(actions, text=self.label_text("إنشاء الحساب"), command=add_account, style="Success.TButton").pack(side="right")
+        ttk.Button(actions, text=self.label_text("إنشاء عدة حسابات"), command=open_bulk_creator).pack(side="right", padx=5)
+        ttk.Button(actions, text=self.label_text("إعادة تعيين كلمة المرور"), command=reset_password).pack(side="right", padx=5)
+        ttk.Button(actions, text=self.label_text("تفعيل المحدد"), command=activate_account, style="Success.TButton").pack(side="left", padx=5)
+        ttk.Button(actions, text=self.label_text("إيقاف المحدد"), command=deactivate_account, style="Danger.TButton").pack(side="left")
+        ttk.Button(actions, text=self.label_text("حذف الحساب"), command=delete_account, style="Danger.TButton").pack(side="left", padx=5)
+        ttk.Button(actions, text=self.label_text("عودة"), command=window.destroy).pack(side="left", padx=5)
+        refresh_accounts()
+        self.center_window(window, 760, 500)
+
+    @staticmethod
+    def role_label_for(role):
+        return {"admin": "مدير", "doctor": "طبيب", "reception": "استقبال"}.get(role, role)
+
     def can_view(self, key):
-        if key in ("insurance_claims", "service_prices", "assets"):
+        if key in ("insurance_claims", "service_prices", "assets", "medical_devices", "staff_credentials", "infection_control"):
             return self.role == "admin"
         if key in ("medication_batches", "sterilization_cycles", "surgeries", "operation_rooms"):
             return self.role in ("admin", "doctor")
@@ -1453,7 +2288,7 @@ class HospitalApp:
         if self.role == "admin":
             return True
         if self.role == "doctor":
-            return key in {"patients", "appts", "labs", "prescriptions", "vitals", "ratings", "attachments", "donations", "surgeries", "messages", "support_tickets", "medication_batches", "sterilization_cycles"}
+            return key in {"patients", "appts", "labs", "radiology", "diagnoses", "prescriptions", "vitals", "ratings", "attachments", "donations", "surgeries", "messages", "support_tickets", "medication_batches", "sterilization_cycles", "translation"}
         if self.role == "reception":
             return key in {"patients", "appts", "bills", "payments", "reminders", "beds", "death_certificate_requests", "messages", "support_tickets"}
         return False
@@ -1461,6 +2296,8 @@ class HospitalApp:
     def page_title_text(self, key, title):
         en = {
             "dashboard": "Dashboard", "clinics": "Clinics", "doctors": "Doctors", "patients": "Patients", "appts": "Appointments",
+            "location": "Hospital location",
+            "medical_devices": "Medical devices",
             "nurses": "Nursing",
             "attendance": "Staff attendance",
             "messages": "Internal chat",
@@ -1497,7 +2334,7 @@ class HospitalApp:
                 self.page_history.append(self.current_page)
             self.current_page = key
             for nav_key, button in self.nav_buttons.items():
-                button.configure(style="Accent.TButton" if nav_key == key else "Nav.TButton")
+                button.configure(style="NavActive.TButton" if nav_key == key else "Nav.TButton")
             for child in self.body.winfo_children():
                 child.destroy()
             if self.table_count_label and self.table_count_label.winfo_exists():
@@ -1511,7 +2348,7 @@ class HospitalApp:
             self.page_history.append(self.current_page)
         self.current_page = key
         for nav_key, button in self.nav_buttons.items():
-            button.configure(style="Accent.TButton" if nav_key == key else "Nav.TButton")
+            button.configure(style="NavActive.TButton" if nav_key == key else "Nav.TButton")
         for child in self.body.winfo_children():
             child.destroy()
         self.page_title.configure(text=str(self.page_title_text(key, PAGES[key]["title"])))
@@ -1522,6 +2359,25 @@ class HospitalApp:
             return
         if key == "emergency":
             self.render_emergency_page()
+            return
+        if key == "command_center":
+            self.render_command_center()
+            return
+        if key == "department_map":
+            self.render_department_map()
+            return
+        if key == "translation":
+            self.render_translation_page()
+            return
+        if key == "location":
+            if self.table_count_label and self.table_count_label.winfo_exists():
+                self.table_count_label.configure(text="")
+            self.render_location_page()
+            return
+        if key == "medical_devices":
+            if self.table_count_label and self.table_count_label.winfo_exists():
+                self.table_count_label.configure(text="")
+            self.render_medical_devices_page()
             return
         if key == "clinics":
             self.render_table(key)
@@ -1547,15 +2403,22 @@ class HospitalApp:
     def render_table(self, key):
         meta = PAGES[key]
         entity = meta["entity"]
-        controls = ttk.Frame(self.body)
+        controls = ttk.Frame(self.body, style="Toolbar.TFrame", padding=(8, 6))
         controls.pack(fill="x", pady=(0, 8))
         if self.can_add(key) and key in FORM_FIELDS:
-            ttk.Button(controls, text=self.label_text("＋ إضافة"), command=lambda: self.open_form(key)).pack(side="right", padx=3)
+            ttk.Button(controls, text=self.label_text("＋ إضافة"), command=lambda: self.open_form(key), style="Success.TButton").pack(side="right", padx=3)
         if key == "clinics":
             ttk.Button(
                 controls,
                 text=self.label_text("فتح صفحة العيادة"),
                 command=self.open_selected_clinic,
+            ).pack(side="right", padx=3)
+        if key == "staff_credentials":
+            ttk.Button(
+                controls,
+                text="قراءة بطاقة ذكية",
+                command=self.scan_staff_card,
+                style="Primary.TButton",
             ).pack(side="right", padx=3)
         if key == "patients":
             ttk.Button(controls, text=self.label_text("الملف الطبي"), command=self.open_selected_profile).pack(side="right", padx=3)
@@ -1571,10 +2434,10 @@ class HospitalApp:
         if key == "appts" and self.can_add("reminders"):
             ttk.Button(controls, text=self.label_text("إنشاء تذكير"), command=self.create_appointment_reminder).pack(side="right", padx=3)
         if key == "appts" and self.can_add("appts"):
-            ttk.Button(controls, text="تسجيل حضور", command=self.check_in_selected_appointment).pack(side="right", padx=3)
-            ttk.Button(controls, text="بدء الكشف", command=self.start_selected_appointment_consultation).pack(side="right", padx=3)
-            ttk.Button(controls, text="إلغاء الموعد", command=self.cancel_selected_appointment).pack(side="right", padx=3)
-            ttk.Button(controls, text="طباعة بطاقة المريض", command=self.print_appointment_patient_card).pack(side="right", padx=3)
+            ttk.Button(controls, text="تسجيل حضور", command=self.check_in_selected_appointment, style="TButton").pack(side="right", padx=3)
+            ttk.Button(controls, text="بدء الكشف", command=self.start_selected_appointment_consultation, style="Success.TButton").pack(side="right", padx=3)
+            ttk.Button(controls, text="إلغاء الموعد", command=self.cancel_selected_appointment, style="Danger.TButton").pack(side="right", padx=3)
+            ttk.Button(controls, text="طباعة بطاقة المريض", command=self.print_appointment_patient_card, style="TButton").pack(side="right", padx=3)
         if key == "reminders" and self.can_add("reminders"):
             ttk.Button(controls, text=self.label_text("إرسال عبر WhatsApp"), command=self.send_whatsapp_reminder).pack(side="right", padx=3)
         if key == "death_certificate_requests":
@@ -1593,10 +2456,10 @@ class HospitalApp:
         if key == "dashboard":
             return
         if self.role == "admin" and key in FORM_FIELDS:
-            ttk.Button(controls, text=self.label_text("حذف المحدد"), command=self.delete_selected).pack(side="left", padx=3)
+            ttk.Button(controls, text=self.label_text("حذف المحدد"), command=self.delete_selected, style="Danger.TButton").pack(side="left", padx=3)
         elif self.role == "admin" and key == "activity":
-            ttk.Button(controls, text=self.label_text("حذف المحدد"), command=self.delete_selected).pack(side="left", padx=3)
-        ttk.Button(controls, text=self.label_text("تصدير CSV"), command=lambda: self.export_csv(key)).pack(side="left", padx=3)
+            ttk.Button(controls, text=self.label_text("حذف المحدد"), command=self.delete_selected, style="Danger.TButton").pack(side="left", padx=3)
+        ttk.Button(controls, text=self.label_text("تصدير CSV"), command=lambda: self.export_csv(key), style="TButton").pack(side="left", padx=3)
         columns = ["_id"] + [name for name, _label in meta["columns"]]
         self.tree = ttk.Treeview(self.body, columns=columns, show="headings", selectmode="browse")
         self.tree.heading("_id", text="#")
@@ -1936,6 +2799,18 @@ class HospitalApp:
         if not query:
             self.focus_search()
             return
+        qr_match = re.search(r"(?:patient|qr|ملف)[^0-9]*(\d+)", query)
+        if qr_match:
+            patient_id = int(qr_match.group(1))
+            patient = self.store.get("patients", patient_id)
+            if patient:
+                self.open_profile(patient)
+                return
+        if query.isdigit():
+            patient = self.store.get("patients", int(query))
+            if patient:
+                self.open_profile(patient)
+                return
         matches = []
         for key, meta in PAGES.items():
             entity = meta["entity"]
@@ -1974,6 +2849,77 @@ class HospitalApp:
         event.widget.selection_range(0, "end")
         return "break"
 
+    def draw_donut_chart(self, canvas, segments, center_text, empty_text):
+        def paint(_event=None):
+            canvas.delete("all")
+            width = max(canvas.winfo_width(), 220)
+            height = max(canvas.winfo_height(), 178)
+            center_x, center_y = width / 2, height / 2 - 2
+            radius = min(58, height * 0.34, width * 0.24)
+            total = sum(max(0, count) for _label, _color, count in segments)
+            if total:
+                start = 90
+                for _label, color, count in segments:
+                    if count <= 0:
+                        continue
+                    extent = -359.99 * count / total
+                    canvas.create_arc(
+                        center_x - radius, center_y - radius,
+                        center_x + radius, center_y + radius,
+                        start=start, extent=extent, style="pieslice",
+                        fill=color, outline=self.panel, width=2,
+                    )
+                    start += extent
+                inner_radius = radius * 0.67
+                canvas.create_oval(
+                    center_x - inner_radius, center_y - inner_radius,
+                    center_x + inner_radius, center_y + inner_radius,
+                    fill=self.panel, outline=self.panel,
+                )
+                canvas.create_text(
+                    center_x, center_y, text=center_text, fill=self.fg,
+                    font=("Segoe UI", 13, "bold"),
+                )
+            else:
+                canvas.create_oval(
+                    center_x - radius, center_y - radius,
+                    center_x + radius, center_y + radius,
+                    outline=self.line, width=12,
+                )
+                canvas.create_text(center_x, center_y, text=empty_text, fill=self.muted, font=("Segoe UI", 9))
+
+        canvas.bind("<Configure>", paint)
+        paint()
+
+    def draw_weekly_appointments(self, canvas, days, counts):
+        def paint(_event=None):
+            canvas.delete("all")
+            width = max(canvas.winfo_width(), 220)
+            height = max(canvas.winfo_height(), 178)
+            left, right, top, bottom = 25, width - 14, 24, height - 33
+            plot_height = bottom - top
+            max_count = max(counts, default=0) or 1
+            for step in range(4):
+                y = bottom - plot_height * step / 3
+                canvas.create_line(left, y, right, y, fill=self.line, dash=(2, 4))
+                canvas.create_text(left - 5, y, text=str(round(max_count * step / 3)), fill=self.muted, anchor="e", font=("Segoe UI", 7))
+            slot_width = (right - left) / max(1, len(days))
+            bar_width = max(7, min(22, slot_width * 0.58))
+            for index, (day, count) in enumerate(zip(days, counts)):
+                center_x = left + slot_width * (index + 0.5)
+                bar_height = plot_height * count / max_count if count else 2
+                canvas.create_rectangle(
+                    center_x - bar_width / 2, bottom - bar_height,
+                    center_x + bar_width / 2, bottom,
+                    fill=self.accent, outline="",
+                )
+                if count:
+                    canvas.create_text(center_x, bottom - bar_height - 8, text=str(count), fill=self.fg, font=("Segoe UI", 8, "bold"))
+                canvas.create_text(center_x, bottom + 12, text=day.strftime("%d/%m"), fill=self.muted, font=("Segoe UI", 7))
+
+        canvas.bind("<Configure>", paint)
+        paint()
+
     def render_dashboard(self):
         snapshot = dashboard_snapshot(self.store)
         shell = ttk.Frame(self.body)
@@ -2001,6 +2947,8 @@ class HospitalApp:
             alert_items.append((f"مخزون منخفض: {len(snapshot['low_stock_medicines'])}", "meds"))
         if snapshot["overdue_invoices"]:
             alert_items.append((f"فواتير متأخرة: {len(snapshot['overdue_invoices'])}", "bills"))
+        if snapshot["medical_device_alerts"] and self.can_view("medical_devices"):
+            alert_items.append((f"أجهزة طبية بها أعطال: {len(snapshot['medical_device_alerts'])}", "medical_devices"))
         if snapshot["expiring_batches"] and self.can_view("medication_batches"):
             alert_items.append((f"دفعات منتهية/قريبة الانتهاء: {len(snapshot['expiring_batches'])}", "medication_batches"))
         if snapshot["assets_due"] and self.can_view("assets"):
@@ -2064,7 +3012,7 @@ class HospitalApp:
         ).pack(side="left", padx=4)
 
         cards = ttk.Frame(dashboard)
-        cards.pack(fill="x", pady=(0, 8))
+        cards.pack(fill="x", pady=(0, 14))
         bed_ratio = (
             f"{snapshot['beds_occupied']} / {snapshot['beds_total']}"
             if snapshot["beds_total"]
@@ -2081,65 +3029,72 @@ class HospitalApp:
             ("الطاقم النشط", snapshot["active_staff"], "طبيب وممرض بحالة نشط", "doctors"),
             ("عيادات مفتوحة", snapshot["open_clinics"], "بحسب الحالة المسجلة", "clinics"),
         )
-        for column in range(4):
+        for column in range(3):
             cards.columnconfigure(column, weight=1, uniform="dashboard_metric")
         for index, (title, value, detail, page) in enumerate(metrics):
-            card = ttk.Frame(cards, style="Panel.TFrame", padding=(12, 10))
-            card.grid(row=index // 4, column=index % 4, sticky="nsew", padx=4, pady=4)
-            ttk.Label(card, text=self.label_text(title), style="Panel.TLabel", font=("Segoe UI", 9, "bold")).pack(anchor="e")
-            ttk.Label(card, text=str(value), style="Panel.TLabel", font=("Segoe UI", 21, "bold")).pack(anchor="e", pady=(3, 0))
-            ttk.Label(card, text=self.label_text(detail), style="Panel.TLabel", wraplength=220).pack(anchor="e")
-            ttk.Button(card, text=self.label_text("فتح"), command=lambda target=page: self.show_page(target)).pack(anchor="e", pady=(6, 0))
+            card = ttk.Frame(cards, style="Card.TFrame", padding=(14, 12))
+            card.grid(row=index // 3, column=index % 3, sticky="nsew", padx=7, pady=7)
+            ttk.Label(card, text=self.label_text(title), style="Panel.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor="e")
+            ttk.Label(card, text=str(value), style="Panel.TLabel", font=("Segoe UI", 22, "bold")).pack(anchor="e", pady=(4, 1))
+            ttk.Label(card, text=self.label_text(detail), style="Muted.TLabel", wraplength=260).pack(anchor="e")
+            ttk.Button(card, text=self.label_text("فتح"), style="Accent.TButton", command=lambda target=page: self.show_page(target)).pack(anchor="e", pady=(8, 0))
 
         charts = ttk.Frame(dashboard)
-        charts.pack(fill="x", pady=(0, 8))
-        bed_panel = ttk.LabelFrame(charts, text="إشغال الأسرّة", padding=8)
-        bed_panel.pack(side="right", fill="both", expand=True, padx=(0, 4))
-        bed_chart = tk.Canvas(bed_panel, height=150, background=self.panel, highlightthickness=0)
-        bed_chart.pack(fill="x")
+        charts.pack(fill="x", pady=(0, 14))
+        for column in range(3):
+            charts.columnconfigure(column, weight=1, uniform="dashboard_chart")
+
         occupied = snapshot["beds_occupied"]
         available = max(0, snapshot["beds_total"] - occupied)
-        if snapshot["beds_total"]:
-            bed_chart.create_arc(28, 12, 148, 132, start=90, extent=-360 * occupied / snapshot["beds_total"], fill="#2563eb", outline=self.panel, style="pieslice")
-            if available:
-                bed_chart.create_arc(28, 12, 148, 132, start=90 - 360 * occupied / snapshot["beds_total"], extent=-360 * available / snapshot["beds_total"], fill="#cbd5e1", outline=self.panel, style="pieslice")
-            bed_chart.create_text(88, 72, text=f"{occupied}/{snapshot['beds_total']}", fill=self.fg, font=("Segoe UI", 11, "bold"))
-            ttk.Label(bed_panel, text=f"مشغول {occupied}  •  متاح {available}").pack(anchor="center")
-        else:
-            bed_chart.create_text(88, 72, text="لا توجد أسرّة", fill=self.fg)
-
-        appointment_panel = ttk.LabelFrame(charts, text="حالات مواعيد اليوم", padding=8)
-        appointment_panel.pack(side="left", fill="both", expand=True, padx=(4, 0))
-        appointment_chart = tk.Canvas(appointment_panel, height=150, background=self.panel, highlightthickness=0)
-        appointment_chart.pack(fill="x")
-        appointment_statuses = (
-            ("مكتمل", "#16a34a"),
-            ("بالانتظار", "#eab308"),
-            ("عاجل", "#dc2626"),
+        bed_panel = ttk.LabelFrame(charts, text="إشغال الأسرّة", padding=(10, 8))
+        bed_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        bed_chart = tk.Canvas(bed_panel, height=178, background=self.panel, highlightthickness=0)
+        bed_chart.pack(fill="x")
+        self.draw_donut_chart(
+            bed_chart,
+            [("مشغول", "#2563eb", occupied), ("متاح", "#cbd5e1", available)],
+            f"{occupied}/{snapshot['beds_total']}" if snapshot["beds_total"] else "—",
+            "لا توجد أسرّة",
         )
+        ttk.Label(bed_panel, text=f"مشغول {occupied}  •  متاح {available}", style="Muted.TLabel").pack(anchor="center")
+
+        appointment_panel = ttk.LabelFrame(charts, text="حالات مواعيد اليوم", padding=(10, 8))
+        appointment_panel.grid(row=0, column=1, sticky="nsew", padx=6)
+        appointment_chart = tk.Canvas(appointment_panel, height=178, background=self.panel, highlightthickness=0)
+        appointment_chart.pack(fill="x")
+        appointment_statuses = (("مكتمل", "#16a34a"), ("بالانتظار", "#eab308"), ("عاجل", "#dc2626"))
         status_counts = [
             (label, color, sum(1 for item in snapshot["appointments_today"] if item.get("status") == label))
             for label, color in appointment_statuses
         ]
         appointment_total = sum(count for _label, _color, count in status_counts)
-        if appointment_total:
-            start_angle = 90
-            for label, color, count in status_counts:
-                if not count:
-                    continue
-                extent = -360 * count / appointment_total
-                appointment_chart.create_arc(28, 12, 148, 132, start=start_angle, extent=extent, fill=color, outline=self.panel, style="pieslice")
-                start_angle += extent
-            appointment_chart.create_text(88, 72, text=str(appointment_total), fill=self.fg, font=("Segoe UI", 11, "bold"))
-            ttk.Label(
-                appointment_panel,
-                text="  •  ".join(f"{label} {count}" for label, _color, count in status_counts),
-            ).pack(anchor="center")
-        else:
-            appointment_chart.create_text(88, 72, text="لا توجد مواعيد", fill=self.fg)
+        self.draw_donut_chart(appointment_chart, status_counts, str(appointment_total), "لا توجد مواعيد")
+        ttk.Label(
+            appointment_panel,
+            text="  •  ".join(f"{label} {count}" for label, _color, count in status_counts),
+            style="Muted.TLabel",
+        ).pack(anchor="center")
+
+        weekly_panel = ttk.LabelFrame(charts, text="حركة المواعيد — آخر ٧ أيام", padding=(10, 8))
+        weekly_panel.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+        weekly_chart = tk.Canvas(weekly_panel, height=178, background=self.panel, highlightthickness=0)
+        weekly_chart.pack(fill="x")
+        appointment_records = self.store.list("appts")
+        cancelled_statuses = {"ملغي", "ملغاة", "ملغى", "cancelled", "canceled"}
+        recent_days = [date.today() - timedelta(days=offset) for offset in range(6, -1, -1)]
+        weekly_counts = [
+            sum(
+                1 for item in appointment_records
+                if item.get("date") == day.isoformat()
+                and str(item.get("status", "")).casefold() not in cancelled_statuses
+            )
+            for day in recent_days
+        ]
+        self.draw_weekly_appointments(weekly_chart, recent_days, weekly_counts)
+        ttk.Label(weekly_panel, text="إجمالي المواعيد غير الملغاة لكل يوم", style="Muted.TLabel").pack(anchor="center")
 
         operations = ttk.Frame(dashboard)
-        operations.pack(fill="both", expand=True, pady=(0, 8))
+        operations.pack(fill="both", expand=True, pady=(0, 14))
         agenda_panel = ttk.LabelFrame(operations, text=self.label_text("مواعيد اليوم"), padding=8)
         agenda_panel.pack(side="right", fill="both", expand=True, padx=(0, 4))
         agenda = ttk.Treeview(agenda_panel, columns=("time", "patient", "doctor", "status", "wait"), show="headings", height=7)
@@ -2227,6 +3182,11 @@ class HospitalApp:
             ).pack(side="right", padx=3, pady=3)
         ttk.Button(
             actions,
+            text="📍 " + self.label_text("موقع المشفى"),
+            command=lambda: self.show_page("location"),
+        ).pack(side="right", padx=3, pady=3)
+        ttk.Button(
+            actions,
             text=self.label_text("شاشة الانتظار"),
             command=self.open_waiting_room,
         ).pack(side="right", padx=3, pady=3)
@@ -2252,10 +3212,23 @@ class HospitalApp:
             text="🚑 متابعة الطوارئ",
             command=lambda: self.show_page("emergency"),
         ).pack(side="right", padx=3, pady=3)
+        if self.can_view("command_center"):
+            ttk.Button(
+                actions,
+                text="غرفة القيادة المركزية",
+                command=lambda: self.show_page("command_center"),
+                style="Accent.TButton",
+            ).pack(side="right", padx=3, pady=3)
         ttk.Button(
             actions,
             text="💬 المحادثة الداخلية",
             command=lambda: self.show_page("messages"),
+        ).pack(side="right", padx=3, pady=3)
+        ttk.Button(
+            actions,
+            text="خريطة أقسام المشفى",
+            command=lambda: self.show_page("department_map"),
+            style="Accent.TButton",
         ).pack(side="right", padx=3, pady=3)
         clinic_shortcuts = ttk.LabelFrame(dashboard, text=self.label_text("العيادات"), padding=8)
         clinic_shortcuts.pack(fill="x", pady=(0, 8))
@@ -2289,12 +3262,683 @@ class HospitalApp:
             text=self.label_text("تعتمد المؤشرات على البيانات المدخلة وليست مراقبة سريرية مباشرة"),
             wraplength=1000,
         ).pack(anchor="e", pady=(0, 6))
+        if self.store.setting("hide_demo_notices", "0") != "1":
+            ttk.Label(
+                dashboard,
+                text="أُضيفت سجلات تدريبية اصطناعية: 20 طبيباً و50 ممرضاً و100 مريض. لا تمثل أشخاصاً حقيقيين.",
+                foreground="#b45309",
+                wraplength=1000,
+            ).pack(anchor="e", pady=(0, 4))
+
+    def render_medical_devices_page(self):
+        devices = self.store.list("medical_devices")
+        working = sum(1 for item in devices if item.get("status") == "يعمل")
+        maintenance = sum(1 for item in devices if item.get("status") == "قيد الصيانة")
+        broken = sum(1 for item in devices if item.get("status") in ("خارج الخدمة", "عطل"))
+
+        page = ttk.Frame(self.body)
+        page.pack(fill="both", expand=True)
+        intro = ttk.Frame(page, style="Panel.TFrame", padding=(18, 14))
+        intro.pack(fill="x", pady=(0, 10))
         ttk.Label(
-            dashboard,
-            text="أُضيفت سجلات تدريبية اصطناعية: 20 طبيباً و50 ممرضاً و100 مريض. لا تمثل أشخاصاً حقيقيين.",
-            foreground="#b45309",
-            wraplength=1000,
-        ).pack(anchor="e", pady=(0, 4))
+            intro,
+            text=self.label_text("الأجهزة الطبية"),
+            style="Panel.TLabel",
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="e")
+        ttk.Label(
+            intro,
+            text="متابعة حالة التشغيل والصيانة للأجهزة المسجلة محلياً",
+            style="Muted.TLabel",
+        ).pack(anchor="e", pady=(4, 0))
+
+        cards = ttk.Frame(page)
+        cards.pack(fill="x", pady=(0, 10))
+        for index, (label, value, color) in enumerate((
+            ("إجمالي الأجهزة", len(devices), "#2563eb"),
+            ("يعمل", working, "#059669"),
+            ("قيد الصيانة", maintenance, "#d97706"),
+            ("خارج الخدمة / عطل", broken, "#dc2626"),
+        )):
+            card = tk.Frame(cards, bg=self.panel, highlightthickness=1, highlightbackground=self.line, padx=12, pady=12)
+            card.grid(row=0, column=index, sticky="nsew", padx=5)
+            cards.columnconfigure(index, weight=1)
+            tk.Frame(card, bg=color, width=6).pack(side="right", fill="y")
+            tk.Label(card, text=label, bg=self.panel, fg=self.muted, font=("Segoe UI", 10, "bold")).pack(anchor="e")
+            tk.Label(card, text=str(value), bg=self.panel, fg=self.fg, font=("Segoe UI", 21, "bold")).pack(anchor="e", pady=(4, 0))
+
+        controls = ttk.Frame(page, style="Toolbar.TFrame", padding=(8, 7))
+        controls.pack(fill="x", pady=(0, 8))
+        ttk.Button(controls, text="+ إضافة جهاز", command=lambda: self.open_form("medical_devices"), style="Success.TButton").pack(side="right", padx=3)
+        ttk.Button(controls, text="تعديل الجهاز", command=lambda: self.edit_selected(), style="TButton").pack(side="right", padx=3)
+        ttk.Button(controls, text="تسجيل عطل", command=self.report_selected_device_fault, style="Danger.TButton").pack(side="right", padx=3)
+        ttk.Button(controls, text="إرجاعه للخدمة", command=self.restore_selected_device, style="Primary.TButton").pack(side="right", padx=3)
+        ttk.Button(controls, text="حذف الجهاز", command=self.delete_selected, style="Danger.TButton").pack(side="left", padx=3)
+
+        columns = ("name", "type", "serial_number", "department", "location", "status", "maintenance_due")
+        self.tree = ttk.Treeview(page, columns=columns, show="headings", selectmode="browse")
+        headings = (
+            ("name", "الجهاز", 220),
+            ("type", "النوع", 130),
+            ("serial_number", "الرقم التسلسلي", 130),
+            ("department", "القسم", 120),
+            ("location", "الموقع", 150),
+            ("status", "الحالة", 120),
+            ("maintenance_due", "الصيانة القادمة", 130),
+        )
+        for key, label, width in headings:
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, anchor="center", stretch=True)
+        self.tree.tag_configure("working", foreground="#166534")
+        self.tree.tag_configure("maintenance", foreground="#b45309")
+        self.tree.tag_configure("broken", foreground="#dc2626")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", lambda _event: self.edit_selected())
+
+        yscroll = ttk.Scrollbar(page, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=yscroll.set)
+        yscroll.place(in_=self.tree, relx=1.0, rely=0, relheight=1.0, anchor="ne")
+
+        for item in sorted(devices, key=lambda row: str(row.get("name", ""))):
+            status = str(item.get("status", ""))
+            tag = "broken" if status in ("خارج الخدمة", "عطل") else "maintenance" if status == "قيد الصيانة" else "working"
+            self.tree.insert("", "end", iid=str(item["id"]), values=tuple(item.get(key, "") for key in columns), tags=(tag,))
+
+    def report_selected_device_fault(self):
+        record = self.selected_record()
+        if not record:
+            self.notify("اختر جهازاً أولاً", "error")
+            return
+        record = dict(record)
+        record["status"] = "عطل"
+        try:
+            self.store.save("medical_devices", record, self.user_name)
+            self.audit(f"تسجيل عطل للجهاز: {record.get('name', '')}")
+            self.notify(f"تنبيه عطل: {record.get('name', '')}", "error")
+            self.open_notification_center()
+            self.show_page("medical_devices", remember=False)
+        except sqlite3.Error as exc:
+            messagebox.showerror("تعذر تسجيل العطل", str(exc), parent=self.root)
+
+    def restore_selected_device(self):
+        record = self.selected_record()
+        if not record:
+            self.notify("اختر جهازاً أولاً", "error")
+            return
+        record = dict(record)
+        record["status"] = "يعمل"
+        try:
+            self.store.save("medical_devices", record, self.user_name)
+            self.audit(f"إعادة جهاز للخدمة: {record.get('name', '')}")
+            self.notify("تمت إعادة الجهاز إلى حالة العمل", "success")
+            self.show_page("medical_devices", remember=False)
+        except sqlite3.Error as exc:
+            messagebox.showerror("تعذر تحديث حالة الجهاز", str(exc), parent=self.root)
+
+    def render_command_center(self):
+        snapshot = dashboard_snapshot(self.store)
+        devices = self.store.list("medical_devices")
+        broken_devices = [item for item in devices if item.get("status") in ("عطل", "خارج الخدمة")]
+        occupied = snapshot["beds_occupied"]
+        total_beds = snapshot["beds_total"]
+        page = ttk.Frame(self.body)
+        page.pack(fill="both", expand=True)
+        header = tk.Frame(page, bg=self.accent, padx=18, pady=14)
+        header.pack(fill="x", pady=(0, 10))
+        tk.Label(header, text="غرفة القيادة المركزية", bg=self.accent, fg="white", font=("Segoe UI", 18, "bold")).pack(anchor="e")
+        tk.Label(header, text=f"{date.today().isoformat()}  |  تحديث تشغيل محلي", bg=self.accent, fg="#dff6f7", font=("Segoe UI", 10)).pack(anchor="e", pady=(4, 0))
+
+        cards = ttk.Frame(page)
+        cards.pack(fill="x", pady=(0, 10))
+        metrics = (
+            ("المرضى المسجلون", snapshot["patients"], "#2563eb"),
+            ("مواعيد اليوم", len(snapshot["appointments_today"]), "#087f8c"),
+            ("الأسرّة المشغولة", f"{occupied}/{total_beds}", "#d97706"),
+            ("حالات حرجة", snapshot["critical_patients"], "#dc2626"),
+            ("أجهزة معطلة", len(broken_devices), "#dc2626"),
+            ("الطوارئ العاجلة", len(snapshot["urgent_appointments"]), "#ea580c"),
+        )
+        for index, (label, value, color) in enumerate(metrics):
+            card = tk.Frame(cards, bg=self.panel, highlightthickness=1, highlightbackground=self.line, padx=12, pady=12)
+            card.grid(row=index // 3, column=index % 3, sticky="nsew", padx=5, pady=5)
+            cards.columnconfigure(index % 3, weight=1)
+            tk.Frame(card, bg=color, width=6).pack(side="right", fill="y")
+            tk.Label(card, text=label, bg=self.panel, fg=self.muted, font=("Segoe UI", 10, "bold")).pack(anchor="e")
+            tk.Label(card, text=str(value), bg=self.panel, fg=self.fg, font=("Segoe UI", 21, "bold")).pack(anchor="e", pady=(3, 0))
+
+        panels = ttk.Frame(page)
+        panels.pack(fill="both", expand=True)
+        left = ttk.LabelFrame(panels, text="تنبيهات التشغيل", padding=10)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        right = ttk.LabelFrame(panels, text="حالة الأقسام", padding=10)
+        right.pack(side="right", fill="both", expand=True, padx=(5, 0))
+        alert_messages = []
+        alert_messages += [f"عطل جهاز: {item.get('name', '')}" for item in broken_devices]
+        alert_messages += [f"مخزون منخفض: {item.get('name', '')}" for item in snapshot["low_stock_medicines"][:5]]
+        if not alert_messages:
+            alert_messages = ["لا توجد تنبيهات تشغيلية مسجلة"]
+        for text in alert_messages:
+            tk.Label(left, text=f"• {text}", bg=self.panel, fg=self.fg, anchor="e", justify="right", wraplength=430).pack(fill="x", pady=4)
+
+        for clinic in self.store.list("clinics")[:8]:
+            status = str(clinic.get("status", ""))
+            color = "#059669" if status == "مفتوحة" else "#dc2626"
+            row = tk.Frame(right, bg=self.panel)
+            row.pack(fill="x", pady=4)
+            tk.Frame(row, bg=color, width=8).pack(side="right", fill="y", padx=(8, 0))
+            tk.Label(row, text=f"{clinic.get('icon', '')} {clinic.get('name', '')}", bg=self.panel, fg=self.fg, font=("Segoe UI", 10, "bold")).pack(side="right")
+            tk.Label(row, text=status, bg=self.panel, fg=color, font=("Segoe UI", 9, "bold")).pack(side="left")
+
+    def render_department_map(self):
+        page = ttk.Frame(self.body)
+        page.pack(fill="both", expand=True)
+        header = tk.Frame(page, bg=self.panel, padx=14, pady=10, highlightthickness=1, highlightbackground=self.line)
+        header.pack(fill="x", pady=(4, 8))
+        tk.Label(header, text="خريطة الأقسام ثلاثية الأبعاد", bg=self.panel, fg=self.fg, font=("Segoe UI", 18, "bold")).pack(side="right")
+        tk.Label(header, text="مستوى واقع رقمي — 2026", bg=self.panel, fg=self.muted, font=("Segoe UI", 9, "bold")).pack(side="right", padx=10)
+
+        controls = tk.Frame(header, bg=self.panel)
+        controls.pack(side="left")
+        floor_var = tk.StringVar(value=self.store.setting("department_map_floor", "الطابق الأول"))
+        ttk.Combobox(
+            controls,
+            textvariable=floor_var,
+            values=["الطابق الأرضي", "الطابق الأول", "الطابق الثاني", "الطابق الثالث"],
+            state="readonly",
+            width=18,
+            justify="right",
+        ).pack(side="left", padx=4)
+        ttk.Button(controls, text="عرض المبنى", command=lambda: floor_var.set("عرض كامل"), style="TButton").pack(side="left", padx=3)
+
+        canvas = tk.Canvas(
+            page,
+            height=590,
+            background="#dde9ec" if not self.dark else "#091421",
+            highlightthickness=0,
+        )
+        canvas.pack(fill="both", expand=True)
+
+        def department_status(name):
+            if name == "الطوارئ":
+                urgent = len(dashboard_snapshot(self.store)["urgent_appointments"])
+                return ("نشط" if urgent else "جاهز", "#dc2626" if urgent else "#059669")
+            if name == "الصيدلية":
+                low = len(dashboard_snapshot(self.store)["low_stock_medicines"])
+                return ("تنبيه مخزون" if low else "متاح", "#d97706" if low else "#059669")
+            devices = [
+                item for item in self.store.list("medical_devices")
+                if item.get("department") == name and item.get("status") in ("عطل", "خارج الخدمة")
+            ]
+            if devices:
+                return ("عطل جهاز", "#dc2626")
+            return ("متاح", "#059669")
+
+        def draw(_event=None):
+            canvas.delete("all")
+            width = max(canvas.winfo_width(), 760)
+            height = max(canvas.winfo_height(), 530)
+            dark = self.dark
+            bg = "#091421" if dark else "#edf4f5"
+            surface = "#173148" if dark else "#fafdfe"
+            edge = "#4a6a7b" if dark else "#aebfc7"
+            shadow = "#050b12" if dark else "#a8bdc4"
+            text = "#eff8fb" if dark else "#163746"
+            canvas.create_rectangle(0, 0, width, height, fill=bg, outline="")
+
+            cx = width * 0.50
+            cy = height * 0.43
+            scale = min(width / 920, height / 590)
+            floor = floor_var.get()
+
+            if floor == "عرض كامل":
+                building_floors = (
+                    ("الطابق الثالث", -70),
+                    ("الطابق الثاني", -35),
+                    ("الطابق الأول", 0),
+                    ("الطابق الأرضي", 35),
+                )
+            else:
+                building_floors = ((floor, 0),)
+
+            departments_by_floor = {
+                "الطابق الأرضي": (("الطوارئ", "#dc2626"), ("الاستقبال", "#087f8c"), ("الصيدلية", "#059669"), ("المختبر", "#9333ea")),
+                "الطابق الأول": (("الأشعة", "#2563eb"), ("العمليات", "#d97706"), ("العناية المركزة", "#0891b2"), ("الأجهزة الطبية", "#087f8c")),
+                "الطابق الثاني": (("الجراحة", "#dc2626"), ("الباطنية", "#2563eb"), ("الأطفال", "#d97706"), ("النسائية", "#9333ea")),
+                "الطابق الثالث": (("التمريض", "#059669"), ("الإدارة", "#087f8c"), ("التعقيم", "#9333ea"), ("غرف الاجتماعات", "#64748b")),
+            }
+
+            canvas.create_oval(cx - 280 * scale, cy + 205 * scale, cx + 300 * scale, cy + 260 * scale, fill="#52636a" if dark else "#cad8dc", outline="")
+            for x in range(70, int(width - 60), 76):
+                canvas.create_line(x, height - 45, x + 20, height - 24, fill=self.line, dash=(2, 5))
+
+            corridor = "#a8bcc4" if not dark else "#26445a"
+
+            for floor_name, offset in building_floors:
+                base_y = cy + offset * scale
+                if floor_name == "عرض كامل":
+                    tx = cx
+                else:
+                    tx = cx
+
+                floor_y = base_y
+                canvas.create_polygon(
+                    tx - 310 * scale, floor_y,
+                    tx, floor_y - 150 * scale,
+                    tx + 310 * scale, floor_y,
+                    tx, floor_y + 150 * scale,
+                    fill=surface, outline=edge, width=2,
+                )
+                canvas.create_polygon(
+                    tx - 310 * scale, floor_y,
+                    tx, floor_y + 150 * scale,
+                    tx, floor_y + 190 * scale,
+                    tx - 310 * scale, floor_y + 40 * scale,
+                    fill=shadow, outline=edge,
+                )
+                canvas.create_polygon(
+                    tx, floor_y + 150 * scale,
+                    tx + 310 * scale, floor_y,
+                    tx + 310 * scale, floor_y + 40 * scale,
+                    tx, floor_y + 190 * scale,
+                    fill="#9fb9c3" if not dark else "#1e3850",
+                    outline=edge,
+                )
+                canvas.create_line(tx - 310 * scale, floor_y, tx, floor_y + 150 * scale, tx + 310 * scale, floor_y, fill=edge)
+                canvas.create_line(tx, floor_y - 150 * scale, tx, floor_y + 150 * scale, fill=edge)
+                canvas.create_polygon(
+                    tx - 150 * scale, floor_y - 55 * scale,
+                    tx, floor_y - 125 * scale,
+                    tx + 150 * scale, floor_y - 55 * scale,
+                    tx, floor_y + 15 * scale,
+                    fill=corridor,
+                    outline=edge,
+                    width=1,
+                )
+                canvas.create_line(tx - 150 * scale, floor_y - 55 * scale, tx + 150 * scale, floor_y - 55 * scale, fill="#d9e7ea" if not dark else "#3e5c70", dash=(7, 5))
+
+                departments = departments_by_floor.get(floor_name, ())
+                positions = (
+                    (-205, -62), (5, -62), (-205, 55), (5, 55),
+                )
+                for index, (name, color) in enumerate(departments):
+                    dx, dy = positions[index]
+                    bx = tx + dx * scale
+                    by = floor_y + dy * scale
+                    bw, bh = 176 * scale, 82 * scale
+                    status, status_color = department_status(name)
+                    tag = f"department:{name}"
+                    canvas.create_rectangle(bx + 7 * scale, by + 8 * scale, bx + bw + 7 * scale, by + bh + 8 * scale, fill=shadow, outline="")
+                    canvas.create_polygon(
+                        bx, by,
+                        bx + bw, by,
+                        bx + bw - 18 * scale, by - 18 * scale,
+                        bx - 18 * scale, by - 18 * scale,
+                        fill="#dbe8ec" if not dark else "#315268",
+                        outline=edge,
+                        tags=(tag,),
+                    )
+                    canvas.create_polygon(
+                        bx, by,
+                        bx + bw, by,
+                        bx + bw, by + bh,
+                        bx, by + bh,
+                        fill="#f8fbfc" if not dark else "#1a2d40",
+                        outline=color,
+                        width=2,
+                        tags=(tag,),
+                    )
+                    canvas.create_line(bx + 18 * scale, by + 10 * scale, bx + bw - 18 * scale, by + 10 * scale, fill=color, width=3, tags=(tag,))
+                    canvas.create_text(bx + bw / 2, by + 30 * scale, text=name, fill=text, font=("Segoe UI", max(8, int(10 * scale)), "bold"), tags=(tag,))
+                    canvas.create_oval(bx + 14 * scale, by + bh - 25 * scale, bx + 26 * scale, by + bh - 13 * scale, fill=status_color, outline="", tags=(tag,))
+                    canvas.create_text(bx + bw - 12 * scale, by + bh - 19 * scale, text=status, fill=status_color, font=("Segoe UI", max(7, int(8 * scale)), "bold"), anchor="e", tags=(tag,))
+
+                canvas.create_text(tx - 280 * scale, floor_y - 118 * scale, text=floor_name, fill=text, font=("Segoe UI", max(9, int(11 * scale)), "bold"), anchor="w")
+
+            canvas.create_oval(width - 92, 28, width - 52, 68, fill=self.accent, outline="white", width=2)
+            canvas.create_text(width - 72, 48, text="N", fill="white", font=("Segoe UI", 10, "bold"))
+            canvas.create_text(20, height - 24, text="2026 • منظور رقمي للطوابق والأقسام ومسارات الخدمة", fill=self.muted, font=("Segoe UI", 9), anchor="sw")
+
+        def select_floor(event):
+            if event:
+                pass
+            draw()
+
+        floor_var.trace_add("write", lambda *_args: select_floor(None))
+        canvas.bind("<Configure>", draw)
+        ttk.Label(page, text="أخضر = متاح  •  برتقالي = تنبيه  •  أحمر = عطل أو طوارئ", style="Muted.TLabel").pack(anchor="e", pady=(6, 0))
+        draw()
+
+    def render_translation_page(self):
+        page = ttk.Frame(self.body)
+        page.pack(fill="both", expand=True)
+        intro = ttk.Frame(page, style="Panel.TFrame", padding=(18, 14))
+        intro.pack(fill="x", pady=(0, 10))
+        ttk.Label(intro, text="الترجمة الفورية", style="Panel.TLabel", font=("Segoe UI", 18, "bold")).pack(anchor="e")
+        ttk.Label(
+            intro,
+            text="أداة ترجمة نصية تجريبية ومبسطة — يلزم مراجعة بشرية للمحتوى الطبي.",
+            style="Muted.TLabel",
+        ).pack(anchor="e", pady=(4, 0))
+
+        source = tk.Text(page, height=7, wrap="word", bg=self.panel, fg=self.fg)
+        source.pack(fill="x", pady=6)
+        target_language = tk.StringVar(value="English")
+        controls = ttk.Frame(page)
+        controls.pack(fill="x", pady=6)
+        ttk.Combobox(
+            controls,
+            textvariable=target_language,
+            values=["English", "Chinese", "Russian", "Turkish"],
+            state="readonly",
+            width=18,
+        ).pack(side="right", padx=5)
+
+        output = tk.Text(page, height=8, wrap="word", bg=self.panel, fg=self.fg)
+        output.pack(fill="x", pady=6)
+
+        dictionaries = {
+            "English": {"أين الطوارئ؟": "Where is the emergency department?", "أحتاج طبيباً": "I need a doctor", "أنا أتألم": "I am in pain", "شكراً": "Thank you"},
+            "Chinese": {"أين الطوارئ؟": "急诊科在哪里？", "أحتاج طبيباً": "我需要医生", "أنا أتألم": "我很疼", "شكراً": "谢谢"},
+            "Russian": {"أين الطوارئ؟": "Где отделение неотложной помощи?", "أحتاج طبيباً": "Мне нужен врач", "أنا أتألم": "Мне больно", "شكراً": "Спасибо"},
+            "Turkish": {"أين الطوارئ؟": "Acil servis nerede?", "أحتاج طبيباً": "Doktor gerekiyor", "أنا أتألم": "Ağrım var", "شكراً": "Teşekkürler"},
+        }
+
+        def translate():
+            text = source.get("1.0", "end-1c").strip()
+            if not text:
+                self.notify("أدخل نصاً للترجمة", "error")
+                return
+            language = target_language.get()
+            result = dictionaries[language].get(text, f"[يلزم مراجعة بشرية] {text}")
+            output.configure(state="normal")
+            output.delete("1.0", "end")
+            output.insert("1.0", result)
+            output.configure(state="normal")
+
+            record = {
+                "id": self.store.next_id("translation"),
+                "patient": "",
+                "language": language,
+                "mode": "نصي",
+                "source_text": text,
+                "translated_text": result,
+                "reviewed": "لا",
+            }
+            self.store.save("translation", record, self.user_name)
+
+        ttk.Button(page, text="ترجمة ومراجعة", command=translate, style="Primary.TButton").pack(anchor="e", pady=8)
+
+    def render_location_page(self):
+        page = ttk.Frame(self.body, padding=(4, 2))
+        page.pack(fill="both", expand=True)
+        intro = ttk.Frame(page, style="Panel.TFrame", padding=(18, 14))
+        intro.pack(fill="x", pady=(0, 12))
+        ttk.Label(
+            intro,
+            text=self.label_text("موقع المشفى"),
+            style="Panel.TLabel",
+            font=("Segoe UI", 17, "bold"),
+        ).pack(anchor="e")
+        ttk.Label(
+            intro,
+            text=self.label_text("خريطة تخطيطية محلية — لا تستخدم خدمات أو خرائط خارجية."),
+            style="Muted.TLabel",
+            wraplength=900,
+        ).pack(anchor="e", pady=(4, 0))
+        address = self.store.setting("hospital_location_address", "")
+        city = self.store.setting("hospital_location_city", "")
+        phone = self.store.setting("hospital_location_phone", "")
+        summary = "  •  ".join(value for value in (address, city, phone) if value)
+        if summary:
+            ttk.Label(
+                intro,
+                text=summary,
+                style="Panel.TLabel",
+                font=("Segoe UI", 11, "bold"),
+            ).pack(anchor="e", pady=(8, 0))
+
+        content = ttk.Frame(page)
+        content.pack(fill="both", expand=True)
+        map_panel = ttk.LabelFrame(content, text=self.label_text("مخطط المنطقة"), padding=10)
+        map_panel.pack(side="right", fill="both", expand=True, padx=(0, 8))
+        self.location_canvas = tk.Canvas(
+            map_panel,
+            width=700,
+            height=440,
+            background="#e8f1f3" if not self.dark else "#13243a",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.location_canvas.pack(fill="both", expand=True)
+        self.location_canvas.bind("<Configure>", self.draw_hospital_location_map)
+        self.location_canvas.bind("<Button-1>", self.move_hospital_map_marker)
+        map_controls = ttk.Frame(map_panel)
+        map_controls.pack(fill="x", pady=(8, 0))
+        floor_label = ttk.Label(
+            map_controls,
+            text=self.store.setting("hospital_location_floor", "الطابق الأرضي"),
+            style="Muted.TLabel",
+            font=("Segoe UI", 10, "bold"),
+        )
+        floor_label.pack(side="right", padx=6)
+        ttk.Button(map_controls, text="＋", width=3, command=lambda: self.adjust_location_zoom(1)).pack(side="left", padx=2)
+        ttk.Button(map_controls, text="−", width=3, command=lambda: self.adjust_location_zoom(-1)).pack(side="left", padx=2)
+        ttk.Button(map_controls, text="إعادة ضبط", command=lambda: self.reset_location_zoom()).pack(side="left", padx=2)
+        self.location_zoom = 1.0
+
+        info_panel = ttk.LabelFrame(content, text=self.label_text("بيانات الموقع"), padding=(16, 14))
+        info_panel.pack(side="left", fill="y", padx=(8, 0))
+        info_panel.configure(width=320)
+        info_panel.pack_propagate(False)
+        editable = self.role == "admin"
+        self.location_vars = {
+            "name": tk.StringVar(value=self.hospital_name),
+            "address": tk.StringVar(value=self.store.setting("hospital_location_address", "")),
+            "city": tk.StringVar(value=self.store.setting("hospital_location_city", "")),
+            "phone": tk.StringVar(value=self.store.setting("hospital_location_phone", "")),
+        }
+        for key, label in (
+            ("name", "اسم المشفى"),
+            ("address", "العنوان"),
+            ("city", "المدينة"),
+            ("phone", "هاتف الاتصال"),
+        ):
+            ttk.Label(info_panel, text=self.label_text(label), style="Panel.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor="e", pady=(10, 4))
+            entry = ttk.Entry(info_panel, textvariable=self.location_vars[key], justify="right")
+            entry.pack(fill="x", ipady=3)
+            if not editable:
+                entry.configure(state="readonly")
+
+        ttk.Separator(info_panel).pack(fill="x", pady=14)
+        self.location_hint = ttk.Label(
+            info_panel,
+            text=self.label_text("انقر على الخريطة لتحديد موضع المشفى."),
+            style="Muted.TLabel",
+            wraplength=270,
+            justify="right",
+        )
+        self.location_hint.pack(anchor="e", fill="x", pady=(0, 10))
+        if editable:
+            ttk.Button(
+                info_panel,
+                text=self.label_text("حفظ بيانات الموقع"),
+                command=self.save_hospital_location,
+                style="Primary.TButton",
+            ).pack(fill="x", pady=(8, 0))
+            ttk.Label(
+                info_panel,
+                text=self.label_text("تغيير اسم المشفى يحدّث هوية التطبيق أيضاً."),
+                style="Muted.TLabel",
+                wraplength=270,
+                justify="right",
+            ).pack(anchor="e", pady=(12, 0))
+        else:
+            ttk.Label(
+                info_panel,
+                text=self.label_text("يمكن للمدير تعديل بيانات الموقع وموضع العلامة."),
+                style="Muted.TLabel",
+                wraplength=270,
+                justify="right",
+            ).pack(anchor="e", pady=(12, 0))
+        self.location_map_x = self._map_coordinate("hospital_location_map_x", 0.62)
+        self.location_map_y = self._map_coordinate("hospital_location_map_y", 0.48)
+        self.draw_hospital_location_map()
+
+    def _map_coordinate(self, key, default):
+        try:
+            return min(0.94, max(0.06, float(self.store.setting(key, str(default)))))
+        except (TypeError, ValueError):
+            return default
+
+    def adjust_location_zoom(self, direction):
+        canvas = getattr(self, "location_canvas", None)
+        if not canvas or not canvas.winfo_exists():
+            return
+        old_zoom = getattr(self, "location_zoom", 1.0)
+        new_zoom = min(1.6, max(0.8, old_zoom + (0.1 * direction)))
+        if new_zoom == old_zoom:
+            return
+        center_x = canvas.winfo_width() / 2
+        center_y = canvas.winfo_height() / 2
+        canvas.scale("all", center_x, center_y, new_zoom / old_zoom, new_zoom / old_zoom)
+        self.location_zoom = new_zoom
+
+    def reset_location_zoom(self):
+        canvas = getattr(self, "location_canvas", None)
+        if not canvas or not canvas.winfo_exists():
+            return
+        self.location_zoom = 1.0
+        self.draw_hospital_location_map()
+
+    def draw_hospital_location_map(self, _event=None):
+        canvas = getattr(self, "location_canvas", None)
+        if not canvas or not canvas.winfo_exists():
+            return
+        width = max(canvas.winfo_width(), 360)
+        height = max(canvas.winfo_height(), 280)
+        dark = self.dark
+        land = "#101d2c" if dark else "#edf5f7"
+        park = "#163640" if dark else "#d1eae7"
+        park_edge = "#23707a" if dark else "#afd6d2"
+        road = "#2c4258" if dark else "#c8dbe2"
+        lane = "#7ba1ae" if dark else "#fafdfe"
+        building = "#1b3044" if dark else "#ffffff"
+        building_edge = "#35566a" if dark else "#bfd2da"
+        text = "#dbeafe" if dark else "#475569"
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill=land, outline="")
+        for x in range(24, width, 48):
+            canvas.create_line(x, 0, x, height, fill=park_edge, dash=(1, 7))
+        for y in range(20, height, 48):
+            canvas.create_line(0, y, width, y, fill=park_edge, dash=(1, 7))
+
+        canvas.create_oval(width * .03, height * .08, width * .28, height * .37, fill=park, outline=park_edge, width=2)
+        canvas.create_oval(width * .74, height * .62, width * .98, height * .94, fill=park, outline=park_edge, width=2)
+        canvas.create_oval(width * .77, height * .05, width * .97, height * .27, fill=park, outline=park_edge, width=2)
+
+        roads = (
+            ((-20, height * .56, width * .25, height * .50, width * .53, height * .57, width + 20, height * .50), 34),
+            ((width * .48, -15, width * .52, height * .30, width * .47, height * .63, width * .53, height + 15), 28),
+            ((width * .10, height * .85, width * .34, height * .74, width * .67, height * .80, width * .95, height * .71), 20),
+        )
+        for points, road_width in roads:
+            canvas.create_line(*points, fill=road, width=road_width, smooth=True, capstyle="round", joinstyle="round")
+            canvas.create_line(*points, fill=lane, width=2, smooth=True, dash=(9, 12))
+
+        blocks = (
+            (.33, .12, .43, .30), (.59, .13, .70, .31),
+            (.08, .68, .25, .79), (.71, .35, .91, .53),
+            (.58, .86, .73, .97), (.29, .84, .42, .94),
+        )
+        for left, top, right, bottom in blocks:
+            canvas.create_rectangle(
+                width * left, height * top, width * right, height * bottom,
+                fill=building, outline=building_edge, width=2,
+            )
+            canvas.create_line(
+                width * (left + .03), height * (top + .04),
+                width * (right - .03), height * (top + .04),
+                fill=park_edge, width=2,
+            )
+
+        canvas.create_line(
+            width * .03, height * .88, width * .39, height * .88,
+            width * .58, height * .69, marker_x if "marker_x" in locals() else width * .62,
+            marker_y if "marker_y" in locals() else height * .48,
+            fill="#ef4444", width=5, smooth=True, dash=(12, 8),
+        )
+        canvas.create_text(width * .22, height * .84, text=self.label_text("مسار الطوارئ"), fill="#dc2626", font=("Segoe UI", 9, "bold"), anchor="w")
+
+        legend_x = width - 150
+        canvas.create_rectangle(legend_x - 8, height - 92, width - 12, height - 12, fill=building, outline=building_edge, width=1)
+        canvas.create_text(legend_x, height - 76, text=self.label_text("دليل الخريطة"), fill=text, font=("Segoe UI", 9, "bold"), anchor="nw")
+        canvas.create_rectangle(legend_x, height - 58, legend_x + 12, height - 46, fill=park, outline=park_edge)
+        canvas.create_text(legend_x + 18, height - 52, text=self.label_text("مساحة خضراء"), fill=text, font=("Segoe UI", 8), anchor="w")
+        canvas.create_rectangle(legend_x, height - 38, legend_x + 12, height - 26, fill=building, outline=building_edge)
+        canvas.create_text(legend_x + 18, height - 32, text=self.label_text("مبنى"), fill=text, font=("Segoe UI", 8), anchor="w")
+
+        canvas.create_text(width * .15, height * .18, text=self.label_text("حديقة"), fill=text, font=("Segoe UI", 9, "bold"))
+        canvas.create_text(width * .85, height * .78, text=self.label_text("مساحة خضراء"), fill=text, font=("Segoe UI", 9, "bold"))
+        canvas.create_text(width * .20, height * .58, text=self.label_text("الطريق الرئيسي"), fill=text, font=("Segoe UI", 8), angle=-3)
+        canvas.create_text(width - 28, 28, text="N", fill=self.accent, font=("Segoe UI", 12, "bold"))
+        canvas.create_line(width - 28, 36, width - 28, 56, fill=self.accent, arrow="last", width=2)
+
+        marker_x = width * self.location_map_x
+        marker_y = height * self.location_map_y
+        canvas.create_rectangle(
+            marker_x - 27, marker_y + 12, marker_x + 27, marker_y + 44,
+            fill=building, outline=building_edge, width=2,
+        )
+        canvas.create_rectangle(
+            marker_x - 13, marker_y + 21, marker_x - 4, marker_y + 32,
+            fill=self.accent, outline="",
+        )
+        canvas.create_rectangle(
+            marker_x + 4, marker_y + 21, marker_x + 13, marker_y + 32,
+            fill=self.accent, outline="",
+        )
+        canvas.create_oval(marker_x - 18, marker_y - 18, marker_x + 18, marker_y + 18, fill=self.accent, outline="white", width=3)
+        canvas.create_text(marker_x, marker_y, text="✚", fill="white", font=("Segoe UI", 13, "bold"))
+        label = self.location_vars["name"].get().strip() if hasattr(self, "location_vars") else self.hospital_name
+        canvas.create_text(
+            marker_x, marker_y - 31, text=label or self.hospital_name,
+            fill=self.fg, font=("Segoe UI", 10, "bold"),
+            anchor="s",
+        )
+        canvas.create_text(
+            12, height - 12, text=self.label_text("رسم تخطيطي محلي"),
+            fill=self.muted, font=("Segoe UI", 8), anchor="sw",
+        )
+
+    def move_hospital_map_marker(self, event):
+        if self.role != "admin":
+            return
+        width = max(self.location_canvas.winfo_width(), 1)
+        height = max(self.location_canvas.winfo_height(), 1)
+        self.location_map_x = min(.94, max(.06, event.x / width))
+        self.location_map_y = min(.88, max(.12, event.y / height))
+        self.location_hint.configure(text=self.label_text("موضع العلامة محدّث؛ اضغط حفظ لتثبيته."))
+        self.draw_hospital_location_map()
+
+    def save_hospital_location(self):
+        if self.role != "admin":
+            self.notify(self.label_text("لا تملك صلاحية تعديل بيانات الموقع"), "error")
+            return
+        values = {key: value.get().strip() for key, value in self.location_vars.items()}
+        if not values["name"]:
+            messagebox.showerror(self.label_text("قيمة غير صالحة"), self.label_text("اسم المشفى مطلوب"), parent=self.root)
+            return
+        self.hospital_name = values["name"]
+        self.store.set_setting("hospital_name", values["name"])
+        self.store.set_setting("hospital_location_address", values["address"])
+        self.store.set_setting("hospital_location_city", values["city"])
+        self.store.set_setting("hospital_location_phone", values["phone"])
+        self.store.set_setting("hospital_location_map_x", f"{self.location_map_x:.5f}")
+        self.store.set_setting("hospital_location_map_y", f"{self.location_map_y:.5f}")
+        self.audit("تحديث بيانات موقع المشفى")
+        self.root.title(self.hospital_name)
+        self.rebuild()
+        self.notify(self.label_text("تم حفظ بيانات موقع المشفى"))
 
     def render_emergency_page(self):
         snapshot = dashboard_snapshot(self.store)
@@ -2626,6 +4270,7 @@ class HospitalApp:
         dialog.title(("تعديل " if record else "إضافة ") + PAGES[page]["title"])
         dialog.transient(self.root)
         dialog.grab_set()
+        dialog.minsize(620, 480)
         dialog.configure(bg=self.bg)
         canvas = tk.Canvas(dialog, background=self.bg, highlightthickness=0, width=520, height=500)
         scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
@@ -2638,9 +4283,13 @@ class HospitalApp:
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window_id, width=event.width))
         widgets = {}
         initial = self.to_form_values(entity, record or {})
+        form_title = ("تعديل " if record else "إضافة ") + PAGES[page]["title"]
+        title_label = ttk.Label(form, text=form_title, font=("Segoe UI", 16, "bold"))
+        title_label.grid(row=0, column=0, columnspan=3, sticky="e", padx=6, pady=(2, 12))
         for row_index, (key, spec) in enumerate(FORM_FIELDS[page]):
+            form_row = row_index + 1
             spec_default = ""
-            ttk.Label(form, text=str(self.label_text(spec["label"]))).grid(row=row_index, column=1, sticky="e", padx=6, pady=5)
+            ttk.Label(form, text=str(self.label_text(spec["label"]))).grid(row=form_row, column=1, sticky="e", padx=6, pady=5)
             kind = spec["kind"]
             if kind == "multiline":
                 widget = tk.Text(form, height=4, width=42, wrap="word", bg=self.panel, fg=self.fg, insertbackground=self.fg)
@@ -2692,15 +4341,15 @@ class HospitalApp:
                 widget.insert(0, str(initial.get(key, spec["default"])))
                 if kind == "file":
                     browse = ttk.Button(form, text="استعراض", command=lambda target=widget: self.choose_file(target))
-                    browse.grid(row=row_index, column=2, padx=3)
-            widget.grid(row=row_index, column=0, sticky="ew", padx=6, pady=5)
+                    browse.grid(row=form_row, column=2, padx=3)
+            widget.grid(row=form_row, column=0, sticky="ew", padx=6, pady=5)
             widgets[key] = widget
         buttons = ttk.Frame(form)
-        buttons.grid(row=len(FORM_FIELDS[page]), column=0, columnspan=3, sticky="ew", pady=12)
-        ttk.Button(buttons, text=self.label_text("حفظ"), command=lambda: self.save_form(page, widgets, dialog, record)).pack(side="right", padx=4)
-        ttk.Button(buttons, text=self.label_text("إلغاء"), command=dialog.destroy).pack(side="right", padx=4)
+        buttons.grid(row=len(FORM_FIELDS[page]) + 1, column=0, columnspan=3, sticky="ew", pady=12)
+        ttk.Button(buttons, text=self.label_text("حفظ"), command=lambda: self.save_form(page, widgets, dialog, record), style="Primary.TButton").pack(side="right", padx=4)
+        ttk.Button(buttons, text=self.label_text("إلغاء"), command=dialog.destroy, style="TButton").pack(side="right", padx=4)
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
-        dialog.geometry("660x600")
+        self.center_window(dialog, 660, 600)
 
     def to_form_values(self, entity, record):
         result = dict(record)
@@ -2896,11 +4545,11 @@ class HospitalApp:
                 raise ValueError("صيغة الوقت يجب أن تكون HH:MM") from exc
         valid_patients = {item.get("name") for item in self.store.list("patients")}
         valid_doctors = {item.get("name") for item in self.store.list("doctors")}
-        if entity in {"appts", "labs", "prescriptions", "vitals", "insurance", "insurance_claims", "payments", "ratings", "reminders", "attachments", "surgeries"} and record.get("patient") not in valid_patients:
+        if entity in {"appts", "labs", "radiology", "diagnoses", "prescriptions", "vitals", "insurance", "insurance_claims", "payments", "ratings", "reminders", "attachments", "surgeries"} and record.get("patient") not in valid_patients:
             raise ValueError("اختر مريضاً مسجلاً في النظام")
-        if entity in {"appts", "prescriptions", "ratings", "surgeries"} and record.get("doctor") not in valid_doctors:
+        if entity in {"appts", "prescriptions", "diagnoses", "ratings", "surgeries"} and record.get("doctor") not in valid_doctors:
             raise ValueError("اختر طبيباً مسجلاً في النظام")
-        if entity in {"appts", "prescriptions", "ratings", "surgeries"}:
+        if entity in {"appts", "prescriptions", "diagnoses", "ratings", "surgeries"}:
             doctor = next((item for item in self.store.list("doctors") if item.get("name") == record.get("doctor")), None)
             if not doctor or doctor.get("status") != "نشط":
                 raise ValueError("لا يمكن ربط سجل بطبيب قبل التحقق منه وتغيير حالته إلى نشط")
@@ -2989,6 +4638,18 @@ class HospitalApp:
                 raise ValueError("اسم الأصل مطلوب")
             if not self.valid_date(record.get("maintenance_due", ""), entity, "maintenance_due"):
                 raise ValueError("موعد الصيانة يجب أن يكون بصيغة YYYY-MM-DD")
+        if entity == "medical_devices":
+            if not str(record.get("name", "")).strip():
+                raise ValueError("اسم الجهاز مطلوب")
+            if not str(record.get("serial_number", "")).strip():
+                raise ValueError("الرقم التسلسلي للجهاز مطلوب")
+            if not str(record.get("department", "")).strip():
+                raise ValueError("القسم المسؤول عن الجهاز مطلوب")
+            if not self.valid_date(record.get("maintenance_due", ""), entity, "maintenance_due"):
+                raise ValueError("تاريخ الصيانة القادمة يجب أن يكون بصيغة YYYY-MM-DD")
+            if record.get("last_service"):
+                if not self.valid_date(record.get("last_service", ""), entity, "last_service"):
+                    raise ValueError("تاريخ آخر صيانة يجب أن يكون بصيغة YYYY-MM-DD")
         if entity == "sterilization_cycles":
             for key, label in (("instrument_set", "مجموعة الأدوات"), ("operator", "المعقّم")):
                 if not str(record.get(key, "")).strip():
@@ -3211,9 +4872,58 @@ class HospitalApp:
             self.store.connection.rollback()
             self.notify(f"تعذر تسجيل النشاط: {exc}", "error")
 
+    def open_notification_center(self):
+        snapshot = dashboard_snapshot(self.store)
+        window = tk.Toplevel(self.root)
+        window.title("مركز التنبيهات")
+        window.geometry("620x560")
+        window.configure(bg=self.bg)
+        window.transient(self.root)
+        self.center_window(window, 620, 560)
+
+        header = tk.Frame(window, bg=self.accent, padx=18, pady=14)
+        header.pack(fill="x")
+        tk.Label(
+            header,
+            text="مركز التنبيهات التشغيلية",
+            bg=self.accent,
+            fg="white",
+            font=("Segoe UI", 16, "bold"),
+        ).pack(anchor="e")
+
+        items = []
+        if snapshot["critical_alert_patients"]:
+            items.append(("حالة حرجة", f"{snapshot['critical_alert_patients']} مريض بحاجة لمتابعة", "emergency", "#dc2626"))
+        if snapshot["urgent_appointments"]:
+            items.append(("مواعيد عاجلة", f"{len(snapshot['urgent_appointments'])} موعد عاجل اليوم", "appts", "#ea580c"))
+        if snapshot["low_stock_medicines"]:
+            items.append(("مخزون الدواء", f"{len(snapshot['low_stock_medicines'])} صنف منخفض أو نفد", "meds", "#d97706"))
+        if snapshot["overdue_invoices"]:
+            items.append(("فواتير متأخرة", f"{len(snapshot['overdue_invoices'])} فاتورة متأخرة", "bills", "#ca8a04"))
+        if snapshot["expiring_batches"] and self.can_view("medication_batches"):
+            items.append(("دفعات الدواء", f"{len(snapshot['expiring_batches'])} دفعة قاربت الانتهاء", "medication_batches", "#9333ea"))
+        if snapshot["medical_device_alerts"] and self.can_view("medical_devices"):
+            items.append(("الأجهزة الطبية", f"{len(snapshot['medical_device_alerts'])} جهاز خارج الخدمة أو به عطل", "medical_devices", "#dc2626"))
+        if snapshot["feedback_complaints"] and self.can_view("feedback"):
+            items.append(("تقييمات منخفضة", f"{len(snapshot['feedback_complaints'])} تقييم يحتاج مراجعة", "feedback", "#2563eb"))
+
+        body = tk.Frame(window, bg=self.panel, padx=16, pady=12)
+        body.pack(fill="both", expand=True)
+        if not items:
+            tk.Label(body, text="لا توجد تنبيهات تشغيلية حالياً", bg=self.panel, fg=self.muted, font=("Segoe UI", 13)).pack(pady=40)
+        for title, detail, page, color in items:
+            card = tk.Frame(body, bg=self.panel, highlightthickness=1, highlightbackground=self.line, padx=12, pady=10)
+            card.pack(fill="x", pady=5)
+            tk.Frame(card, bg=color, width=7).pack(side="right", fill="y", padx=(10, 0))
+            tk.Label(card, text=title, bg=self.panel, fg=self.fg, font=("Segoe UI", 12, "bold")).pack(anchor="e")
+            tk.Label(card, text=detail, bg=self.panel, fg=self.muted, font=("Segoe UI", 11)).pack(anchor="e", pady=(3, 0))
+            ttk.Button(card, text="فتح", command=lambda target=page: (window.destroy(), self.show_page(target)), style="Primary.TButton").pack(side="left")
+
     def notify(self, message, kind="success"):
         if not self.status_label or not self.status_label.winfo_exists():
             return
+        if kind in ("error", "info"):
+            self.play_notification_sound()
         colors = {"success": "#15803d", "error": "#dc2626", "info": "#2563eb"}
         color = colors.get(kind, colors["info"])
         self.status_label.configure(text=message, foreground=color)
@@ -3256,6 +4966,13 @@ class HospitalApp:
                 self.status_label.configure(text="💾 قاعدة بيانات محلية على هذا الجهاز", foreground=self.fg)
 
         self.toast_after_id = self.root.after(4200, dismiss)
+
+    def play_notification_sound(self):
+        if self.store.setting("alert_sound", "1") == "1":
+            try:
+                self.root.bell()
+            except tk.TclError:
+                pass
 
     def toggle_emergency_mode(self):
         if self.role != "admin":
@@ -3314,7 +5031,7 @@ class HospitalApp:
             if self.current_page == "dashboard":
                 self.show_page("dashboard", remember=False)
 
-        ttk.Button(form, text="إرسال التقييم", command=submit, style="Accent.TButton").pack(pady=14)
+        ttk.Button(form, text="إرسال التقييم", command=submit, style="Primary.TButton").pack(pady=14)
 
     def toggle_theme(self):
         self.dark = not self.dark
@@ -3338,24 +5055,210 @@ class HospitalApp:
         if page != "dashboard":
             self.show_page(page, remember=False)
 
-    def customize_brand(self):
-        name = simpledialog.askstring("هوية المشفى", "اسم المشفى:", initialvalue=self.hospital_name, parent=self.root)
-        if name is None:
+    def open_settings_center(self):
+        if self.role != "admin":
+            self.notify("الإعدادات متاحة للمدير فقط", "error")
             return
-        name = name.strip()
-        if not name:
-            messagebox.showerror("قيمة غير صالحة", "اسم المشفى مطلوب")
-            return
-        color = colorchooser.askcolor(color=self.accent, title="اختر اللون الرئيسي")[1]
-        self.hospital_name = name
-        self.store.set_setting("hospital_name", name)
-        if color:
+
+        window = tk.Toplevel(self.root)
+        window.title("مركز إعدادات المشفى")
+        window.geometry("760x620")
+        window.configure(bg=self.bg)
+        window.transient(self.root)
+        self.center_window(window, 760, 620)
+
+        header = tk.Frame(window, bg=self.accent, padx=20, pady=16)
+        header.pack(fill="x")
+        tk.Label(
+            header,
+            text="مركز إعدادات المشفى",
+            bg=self.accent,
+            fg="white",
+            font=("Segoe UI", 17, "bold"),
+            anchor="e",
+        ).pack(anchor="e")
+        tk.Label(
+            header,
+            text="هوية النظام والمظهر وبيانات الموقع",
+            bg=self.accent,
+            fg="#dff6f7",
+            font=("Segoe UI", 10),
+            anchor="e",
+        ).pack(anchor="e", pady=(4, 0))
+
+        content = tk.Frame(window, bg=self.panel, padx=22, pady=18)
+        content.pack(fill="both", expand=True)
+        tabs = ttk.Notebook(content)
+        tabs.pack(fill="both", expand=True)
+
+        identity = ttk.Frame(tabs, padding=18)
+        appearance = ttk.Frame(tabs, padding=18)
+        location = ttk.Frame(tabs, padding=18)
+        operations = ttk.Frame(tabs, padding=18)
+        privacy = ttk.Frame(tabs, padding=18)
+        tabs.add(identity, text="هوية المشفى")
+        tabs.add(appearance, text="المظهر")
+        tabs.add(location, text="الموقع")
+        tabs.add(operations, text="التشغيل والتنبيهات")
+        tabs.add(privacy, text="الخصوصية والطباعة")
+
+        name_var = tk.StringVar(value=self.hospital_name)
+        address_var = tk.StringVar(value=self.store.setting("hospital_location_address", ""))
+        city_var = tk.StringVar(value=self.store.setting("hospital_location_city", ""))
+        phone_var = tk.StringVar(value=self.store.setting("hospital_location_phone", ""))
+        emergency_var = tk.StringVar(value=self.store.setting("emergency_phone", ""))
+        floor_var = tk.StringVar(value=self.store.setting("hospital_location_floor", "الطابق الأرضي"))
+        refresh_var = tk.StringVar(value=self.store.setting("refresh_interval", "30"))
+        density_var = tk.StringVar(value=self.store.setting("row_density", "comfortable"))
+        sidebar_var = tk.StringVar(value=self.store.setting("sidebar_default", "collapsed"))
+        alert_sound_var = tk.BooleanVar(value=self.store.setting("alert_sound", "1") == "1")
+        compact_alerts_var = tk.BooleanVar(value=self.store.setting("compact_alerts", "0") == "1")
+        print_header_var = tk.BooleanVar(value=self.store.setting("print_hospital_header", "1") == "1")
+        audit_detail_var = tk.BooleanVar(value=self.store.setting("audit_detail", "1") == "1")
+        hide_demo_var = tk.BooleanVar(value=self.store.setting("hide_demo_notices", "0") == "1")
+
+        ttk.Label(identity, text="اسم المشفى", font=("Segoe UI", 11, "bold")).pack(anchor="e", pady=(4, 6))
+        ttk.Entry(identity, textvariable=name_var, justify="right").pack(fill="x", ipady=5)
+        ttk.Label(
+            identity,
+            text="يظهر الاسم في الشريط الجانبي، شاشة الدخول، والعناوين.",
+            style="Muted.TLabel",
+            wraplength=620,
+        ).pack(anchor="e", pady=(8, 14))
+
+        accent_var = tk.StringVar(value=self.accent)
+        ttk.Label(identity, text="اللون الرئيسي", font=("Segoe UI", 11, "bold")).pack(anchor="e", pady=(4, 6))
+        color_row = ttk.Frame(identity)
+        color_row.pack(fill="x")
+        color_entry = ttk.Entry(color_row, textvariable=accent_var, width=18, justify="center")
+        color_entry.pack(side="right", padx=4)
+
+        def choose_accent():
+            selected = colorchooser.askcolor(color=accent_var.get(), title="اختر اللون الرئيسي", parent=window)[1]
+            if selected:
+                accent_var.set(selected)
+
+        ttk.Button(color_row, text="اختيار اللون", command=choose_accent, style="TButton").pack(side="right")
+
+        theme_var = tk.StringVar(value="dark" if self.dark else "light")
+        ttk.Label(appearance, text="نمط واجهة المستخدم", font=("Segoe UI", 11, "bold")).pack(anchor="e", pady=(4, 8))
+        theme_row = ttk.Frame(appearance)
+        theme_row.pack(fill="x")
+        ttk.Radiobutton(theme_row, text="فاتح", variable=theme_var, value="light").pack(side="right", padx=8)
+        ttk.Radiobutton(theme_row, text="داكن", variable=theme_var, value="dark").pack(side="right", padx=8)
+        ttk.Label(
+            appearance,
+            text="الوضع الداكن يحافظ على تباين عالي ويقلل الإنارة في أقسام الطوارئ.",
+            style="Muted.TLabel",
+            wraplength=620,
+        ).pack(anchor="e", pady=(12, 4))
+        ttk.Label(appearance, text="كثافة الصفوف", font=("Segoe UI", 11, "bold")).pack(anchor="e", pady=(16, 6))
+        density_row = ttk.Frame(appearance)
+        density_row.pack(fill="x")
+        for value, label in (("compact", "مضغوط"), ("comfortable", "مريح"), ("spacious", "واسع")):
+            ttk.Radiobutton(density_row, text=label, variable=density_var, value=value).pack(side="right", padx=8)
+        ttk.Label(appearance, text="حالة الشريط الجانبي عند تسجيل الدخول", font=("Segoe UI", 11, "bold")).pack(anchor="e", pady=(16, 6))
+        sidebar_row = ttk.Frame(appearance)
+        sidebar_row.pack(fill="x")
+        ttk.Radiobutton(sidebar_row, text="مخفي", variable=sidebar_var, value="collapsed").pack(side="right", padx=8)
+        ttk.Radiobutton(sidebar_row, text="مفتوح", variable=sidebar_var, value="open").pack(side="right", padx=8)
+
+        for var, label in (
+            (address_var, "عنوان المشفى"),
+            (city_var, "المدينة / المنطقة"),
+            (phone_var, "رقم الطوارئ أو الاستقبال"),
+        ):
+            ttk.Label(location, text=label, font=("Segoe UI", 11, "bold")).pack(anchor="e", pady=(10, 5))
+            ttk.Entry(location, textvariable=var, justify="right").pack(fill="x", ipady=5)
+        ttk.Label(location, text="الطابق الافتراضي في الخريطة", font=("Segoe UI", 11, "bold")).pack(anchor="e", pady=(10, 5))
+        ttk.Combobox(
+            location,
+            textvariable=floor_var,
+            values=["الطابق الأرضي", "الطابق الأول", "الطابق الثاني", "الطابق الثالث"],
+            state="readonly",
+            justify="right",
+        ).pack(fill="x", ipady=4)
+        ttk.Separator(location).pack(fill="x", pady=15)
+        ttk.Button(
+            location,
+            text="فتح خريطة الموقع",
+            command=lambda: (window.destroy(), self.show_page("location")),
+            style="Primary.TButton",
+        ).pack(anchor="e")
+
+        ttk.Label(operations, text="فاصل تحديث لوحة التشغيل", font=("Segoe UI", 11, "bold")).pack(anchor="e", pady=(4, 6))
+        refresh_row = ttk.Frame(operations)
+        refresh_row.pack(fill="x")
+        refresh_combo = ttk.Combobox(
+            refresh_row,
+            textvariable=refresh_var,
+            values=["15", "30", "60", "120"],
+            state="readonly",
+            justify="center",
+            width=14,
+        )
+        refresh_combo.pack(side="right")
+        ttk.Label(refresh_row, text="ثانية", style="Muted.TLabel").pack(side="right", padx=8)
+        ttk.Separator(operations).pack(fill="x", pady=14)
+        ttk.Checkbutton(operations, text="تشغيل صوت الإشعارات والتنبيهات", variable=alert_sound_var).pack(anchor="e", pady=5)
+        ttk.Checkbutton(operations, text="عرض التنبيهات بتنسيق مضغوط", variable=compact_alerts_var).pack(anchor="e", pady=5)
+
+        ttk.Checkbutton(privacy, text="إضافة هوية المشفى إلى الرسوم والطباعة", variable=print_header_var).pack(anchor="e", pady=8)
+        ttk.Checkbutton(privacy, text="توسيع تفاصيل سجل التدقيق", variable=audit_detail_var).pack(anchor="e", pady=8)
+        ttk.Checkbutton(privacy, text="إخفاء تنبيهات البيانات التجريبية", variable=hide_demo_var).pack(anchor="e", pady=8)
+        ttk.Label(
+            privacy,
+            text="هذه الخيارات تخص الواجهة فقط ولا تفعّل التشفير أو التحكم الخارجي بالصلاحيات.",
+            style="Muted.TLabel",
+            wraplength=620,
+            justify="right",
+        ).pack(anchor="e", pady=(14, 0))
+
+        footer = ttk.Frame(content)
+        footer.pack(fill="x", pady=(14, 0))
+
+        def save_settings():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showerror("قيمة غير صالحة", "اسم المشفى مطلوب", parent=window)
+                return
+            color = accent_var.get().strip()
+            if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+                messagebox.showerror("قيمة غير صالحة", "اللون يجب أن يكون بصيغة مثل #087f8c", parent=window)
+                return
+
+            self.hospital_name = name
             self.accent = color
+            self.store.set_setting("hospital_name", name)
             self.store.set_setting("accent", color)
-        self.audit("تخصيص هوية المشفى")
-        self.apply_theme()
-        self.root.title(name)
-        self.rebuild()
+            self.store.set_setting("hospital_location_address", address_var.get().strip())
+            self.store.set_setting("hospital_location_city", city_var.get().strip())
+            self.store.set_setting("hospital_location_phone", phone_var.get().strip())
+            self.store.set_setting("emergency_phone", phone_var.get().strip())
+            self.store.set_setting("hospital_location_floor", floor_var.get())
+            self.store.set_setting("refresh_interval", refresh_var.get())
+            self.store.set_setting("row_density", density_var.get())
+            self.store.set_setting("sidebar_default", sidebar_var.get())
+            self.store.set_setting("alert_sound", "1" if alert_sound_var.get() else "0")
+            self.store.set_setting("compact_alerts", "1" if compact_alerts_var.get() else "0")
+            self.store.set_setting("print_hospital_header", "1" if print_header_var.get() else "0")
+            self.store.set_setting("audit_detail", "1" if audit_detail_var.get() else "0")
+            self.store.set_setting("hide_demo_notices", "1" if hide_demo_var.get() else "0")
+            selected_dark = theme_var.get() == "dark"
+            if selected_dark != self.dark:
+                self.dark = selected_dark
+                self.store.set_setting("theme", "dark" if selected_dark else "light")
+            self.audit("تحديث إعدادات المشفى")
+            window.destroy()
+            self.apply_theme()
+            self.rebuild()
+            self.notify("تم حفظ إعدادات المشفى")
+
+        ttk.Button(footer, text="حفظ الإعدادات", command=save_settings, style="Primary.TButton").pack(side="right")
+        ttk.Button(footer, text="إغلاق", command=window.destroy, style="TButton").pack(side="right", padx=6)
+
+    def customize_brand(self):
+        self.open_settings_center()
 
     def export_backup(self):
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")], initialfile=f"hospital-backup-{date.today().isoformat()}.json")
@@ -3429,6 +5332,38 @@ class HospitalApp:
         self.notify("أضيف 50 مريضاً و50 موعداً تجريبياً")
         self.show_page(self.current_page)
 
+    def scan_staff_card(self):
+        card_id = simpledialog.askstring(
+            "قراءة بطاقة موظف",
+            "أدخل رقم البطاقة الذكية أو امسح الرمز:",
+            parent=self.root,
+        )
+        if card_id is None:
+            return
+        card_id = card_id.strip()
+        credential = next(
+            (item for item in self.store.list("staff_credentials")
+             if str(item.get("card_id", "")).strip() == card_id),
+            None,
+        )
+        if not credential or credential.get("status") != "نشطة":
+            messagebox.showerror("بطاقة غير صالحة", "البطاقة غير مسجلة أو غير نشطة", parent=self.root)
+            return
+        record = {
+            "id": self.store.next_id("attendance"),
+            "employee": credential.get("employee", ""),
+            "department": credential.get("department", ""),
+            "shift": "صباحي",
+            "date": date.today().isoformat(),
+            "time": datetime.now().strftime("%H:%M"),
+            "status": "حاضر",
+        }
+        try:
+            self.store.save("attendance", record, self.user_name)
+            self.notify(f"تم تسجيل حضور: {credential.get('employee', '')}")
+        except sqlite3.Error as exc:
+            messagebox.showerror("تعذر تسجيل الحضور", str(exc), parent=self.root)
+
     def open_selected_profile(self):
         record = self.selected_record()
         if record:
@@ -3488,7 +5423,7 @@ class HospitalApp:
         body = tk.Text(detail, wrap="word", height=24, bg=self.panel, fg=self.fg)
         body.pack(fill="both", expand=True, pady=6)
         history = []
-        for entity, label in (("appts", "المواعيد"), ("labs", "التحاليل"), ("prescriptions", "الوصفات"), ("vitals", "العلامات الحيوية"), ("bills", "الفواتير"), ("attachments", "المستندات"), ("reminders", "التذكيرات")):
+        for entity, label in (("appts", "المواعيد"), ("labs", "التحاليل"), ("radiology", "الأشعة"), ("diagnoses", "التشخيصات"), ("prescriptions", "الأدوية والوصفات"), ("surgeries", "العمليات"), ("vitals", "العلامات الحيوية"), ("bills", "الفواتير"), ("attachments", "المستندات"), ("reminders", "التذكيرات")):
             rows = [row for row in self.store.list(entity) if row.get("patient") == patient.get("name")]
             if rows:
                 history.append(f"\n{label}")
@@ -3506,7 +5441,7 @@ class HospitalApp:
             ttk.Button(buttons, text="إضافة علامة حيوية", command=lambda: self.open_form("vitals")).pack(side="right", padx=4)
             ttk.Button(buttons, text=self.label_text("طباعة التقرير الطبي"), command=lambda: self.print_medical_report(patient)).pack(side="right", padx=4)
         ttk.Button(buttons, text="بطاقة QR", command=lambda: self.show_qr(patient)).pack(side="right", padx=4)
-        ttk.Button(buttons, text="إغلاق", command=dialog.destroy).pack(side="left")
+        ttk.Button(buttons, text="إغلاق", command=dialog.destroy, style="TButton").pack(side="left")
 
     def print_selected_medical_report(self):
         if self.role not in ("admin", "doctor"):
@@ -3524,6 +5459,9 @@ class HospitalApp:
         sections = [
             ("المواعيد", "appts", ("date", "التاريخ"), ("time", "الوقت"), ("doctor", "الطبيب"), ("status", "الحالة")),
             ("التحاليل", "labs", ("date", "التاريخ"), ("type", "نوع التحليل"), ("status", "الحالة")),
+            ("الأشعة", "radiology", ("date", "التاريخ"), ("type", "الفحص"), ("body_part", "المنطقة"), ("status", "الحالة"), ("report", "التقرير")),
+            ("التشخيصات", "diagnoses", ("date", "التاريخ"), ("doctor", "الطبيب"), ("diagnosis", "التشخيص"), ("severity", "الخطورة"), ("status", "الحالة")),
+            ("العمليات", "surgeries", ("date", "التاريخ"), ("procedure", "الإجراء"), ("doctor", "الطبيب"), ("room", "الغرفة"), ("status", "الحالة")),
             ("الوصفات المسجلة", "prescriptions", ("date", "التاريخ"), ("doctor", "الطبيب"), ("medicine", "الدواء"), ("dosage", "الجرعة"), ("frequency", "التكرار"), ("duration", "المدة")),
             ("العلامات الحيوية المسجلة", "vitals", ("date", "التاريخ"), ("bloodPressure", "ضغط الدم"), ("bloodSugar", "سكر الدم"), ("temperature", "الحرارة"), ("pulse", "النبض")),
             ("الفواتير", "bills", ("date", "التاريخ"), ("amount", "المبلغ"), ("balance", "المتبقي"), ("status", "الحالة")),
@@ -3591,6 +5529,15 @@ class HospitalApp:
             return
         window = tk.Toplevel(self.root)
         window.title("البطاقة الصحية QR")
+        window.geometry("420x420")
+        window.configure(bg=self.panel)
+        window.transient(self.root)
+        self.center_window(window, 420, 420)
+        ttk.Label(
+            window,
+            text="امسح رمز الملف لعرض معلومات المريض",
+            font=("Segoe UI", 13, "bold"),
+        ).pack(pady=(12, 4))
         canvas = tk.Canvas(window, width=260, height=260, bg="white", highlightthickness=0)
         canvas.pack(padx=15, pady=10)
         scale, border = 8, 4
@@ -3598,7 +5545,17 @@ class HospitalApp:
             for x, dark in enumerate(row):
                 if dark:
                     canvas.create_rectangle((x + border) * scale, (y + border) * scale, (x + border + 1) * scale, (y + border + 1) * scale, fill="black", outline="black")
-        ttk.Label(window, text=f"{patient['name']} — رقم الملف {patient['id']}").pack(pady=(0, 12))
+        ttk.Label(
+            window,
+            text=f"{patient['name']} — رقم الملف {patient['id']}",
+            font=("Segoe UI", 12, "bold"),
+        ).pack(pady=(4, 8))
+        ttk.Button(
+            window,
+            text="عرض الملف وجميع الفحوصات",
+            command=lambda: (window.destroy(), self.open_profile(patient)),
+            style="Primary.TButton",
+        ).pack(pady=(0, 12))
 
     def open_selected_attachment(self):
         record = self.selected_record()
@@ -3922,7 +5879,7 @@ class HospitalApp:
             transcript.insert("end", f"\nأنت: {text}\nالمساعد: {answer}\n")
             question.delete(0, "end")
             transcript.see("end")
-        ttk.Button(row, text="إرسال", command=send).pack(side="left")
+        ttk.Button(row, text="إرسال", command=send, style="Primary.TButton").pack(side="left")
         question.bind("<Return>", lambda _event: send())
         transcript.insert("1.0", "الأسئلة الشائعة: حجز موعد، معلومات الصيدلية، ساعات العمل.\n")
         ttk.Button(window, text="حجز موعد سريع", command=lambda: self.chatbot_quick_booking(window)).pack(pady=(0, 8))
@@ -3941,22 +5898,40 @@ class HospitalApp:
         due = [item for item in self.store.list("reminders") if item.get("status") == "مجدول" and item.get("date") == today and item.get("time") <= clock]
         if not due:
             return
+        self.play_notification_sound()
         for item in due:
             messagebox.showinfo("تذكير بموعد", f"{item.get('patient')} — {item.get('message')} ({item.get('time')})")
             item["status"] = "تم الإشعار"
             self.store.save("reminders", item, self.user_name, item["id"])
 
+    def check_device_alerts(self):
+        if not hasattr(self, "device_alert_ids"):
+            self.device_alert_ids = set()
+        alerts = [
+            item for item in self.store.list("medical_devices")
+            if item.get("status") in ("عطل", "خارج الخدمة")
+        ]
+        new_alerts = [item for item in alerts if str(item.get("id")) not in self.device_alert_ids]
+        for item in new_alerts:
+            self.device_alert_ids.add(str(item.get("id")))
+            self.notify(f"تنبيه جهاز معطل: {item.get('name', 'جهاز طبية')}", "error")
+
     def reminder_tick(self):
         if not self.root.winfo_exists():
             return
         self.check_reminders()
+        self.check_device_alerts()
         if self.current_page == "dashboard":
             position = self.dashboard_canvas.yview()[0] if hasattr(self, "dashboard_canvas") else 0
             self.show_page("dashboard", remember=False)
             self.root.after_idle(lambda: self.dashboard_canvas.yview_moveto(position))
         elif self.current_page == "emergency":
             self.show_page("emergency", remember=False)
-        self.root.after(30000, self.reminder_tick)
+        try:
+            interval_seconds = max(15, int(self.store.setting("refresh_interval", "30")))
+        except (TypeError, ValueError):
+            interval_seconds = 30
+        self.root.after(interval_seconds * 1000, self.reminder_tick)
 
     def close(self):
         try:
